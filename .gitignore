@@ -1,0 +1,22 @@
+# Your real config: holds your D1 database id and your admin/dev account ids.
+# Start from wrangler.example.toml instead.
+wrangler.toml
+
+# Secrets and local state
+.env
+.dev.vars
+.wrangler/
+
+# Backups of a live database contain real player data
+backup-*.sql
+*.sql.bak
+
+# Dependencies and logs
+node_modules/
+*.log
+
+# Editors and OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

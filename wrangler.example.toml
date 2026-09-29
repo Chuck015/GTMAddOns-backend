@@ -1,0 +1,21 @@
+# Copy this file to wrangler.toml and fill it in. wrangler.toml is not committed.
+name = "swapinfo-backend"
+main = "src/index.ts"
+compatibility_date = "2026-09-01"
+
+[vars]
+# Comma-separated Minecraft UUIDs (dashed or undashed) allowed to use dev
+# mode (Settings in the /gao menu). Look one up at https://mcuuid.net
+DEV_UUIDS = ""
+
+# Same format: the accounts allowed to use Admin mode in the mod, which deletes
+# players' stats data (a player's whole history, or a single fight). Kept
+# separate from DEV_UUIDS on purpose: being a tester shouldn't mean being able
+# to delete data. Leave it "" to switch admin mode off for everyone.
+ADMIN_UUIDS = ""
+
+[[d1_databases]]
+binding = "DB"
+database_name = "swapinfo"
+# Printed by `npx wrangler d1 create swapinfo`
+database_id = "YOUR-D1-DATABASE-ID"

@@ -1,0 +1,16 @@
+{
+  "name": "swapinfo-backend",
+  "private": true,
+  "license": "AGPL-3.0-only",
+  "author": "Chuck015",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20260925.1",
+    "typescript": "^5.6.0",
+    "wrangler": "^4.0.0"
+  }
+}
