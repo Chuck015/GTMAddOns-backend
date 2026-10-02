@@ -37,6 +37,7 @@ CREATE TABLE IF NOT EXISTS fights (
 
 CREATE INDEX IF NOT EXISTS fights_uuid_ended ON fights (uuid, ended_at);
 CREATE INDEX IF NOT EXISTS fights_uuid_category_ended ON fights (uuid, category, ended_at);
+CREATE INDEX IF NOT EXISTS fights_category_uuid_ended ON fights (category, uuid, ended_at);
 
 CREATE TABLE IF NOT EXISTS swaps (
 	id                 INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -82,6 +83,7 @@ CREATE TABLE IF NOT EXISTS fight_guns (
 );
 
 CREATE INDEX IF NOT EXISTS fight_guns_uuid ON fight_guns (uuid);
+CREATE INDEX IF NOT EXISTS fight_guns_fight ON fight_guns (fight_id);
 
 CREATE TABLE IF NOT EXISTS fight_combos (
 	fight_id     INTEGER NOT NULL,
@@ -97,3 +99,30 @@ CREATE TABLE IF NOT EXISTS fight_combos (
 );
 
 CREATE INDEX IF NOT EXISTS fight_combos_uuid ON fight_combos (uuid);
+CREATE INDEX IF NOT EXISTS fight_combos_fight ON fight_combos (fight_id);
+-- One counter the worker bumps when an admin deletes data, so cached leaderboards
+-- (kept for minutes, shared across the data center) are dropped at once.
+CREATE TABLE IF NOT EXISTS leaderboard_meta (
+  k TEXT PRIMARY KEY,
+  v INTEGER NOT NULL
+);
+INSERT OR IGNORE INTO leaderboard_meta (k, v) VALUES ('version', 1);
+-- Ready-made leaderboards. The worker stores the finished JSON for each (category, number of
+-- fights) view with no opponent filter, so opening it costs one row read instead of the
+-- whole ranking query. Rebuilt on demand once it is older than five minutes, and wiped when
+-- an admin deletes data.
+CREATE TABLE IF NOT EXISTS leaderboard_snapshots (
+  category    TEXT    NOT NULL,
+  fights      INTEGER NOT NULL,
+  body        TEXT    NOT NULL,
+  computed_at INTEGER NOT NULL,
+  PRIMARY KEY (category, fights)
+);
+-- Every leaderboard view (category, number of fights, opponent filter) stored as finished JSON,
+-- replacing leaderboard_snapshots (no opponent filter only) and the Cloudflare cache, which does
+-- nothing on workers.dev. Rows unused for an hour are deleted when a view is stored.
+CREATE TABLE IF NOT EXISTS leaderboard_views (
+  key         TEXT PRIMARY KEY,
+  body        TEXT    NOT NULL,
+  computed_at INTEGER NOT NULL
+);

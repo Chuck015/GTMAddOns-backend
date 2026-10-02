@@ -13,6 +13,9 @@ DEV_UUIDS = ""
 # separate from DEV_UUIDS on purpose: being a tester shouldn't mean being able
 # to delete data. Leave it "" to switch admin mode off for everyone.
 ADMIN_UUIDS = ""
+# Oldest mod version allowed to upload fights (e.g. "1.1.0"). Set it only after that version
+# is on GitHub Releases: older mods are then refused and updaters fetch the new one. Empty = off.
+MIN_MOD_VERSION = ""
 
 [[d1_databases]]
 binding = "DB"

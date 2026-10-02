@@ -38,6 +38,8 @@ export interface Env {
 	DEV_UUIDS: string;
 	/** Comma-separated UUIDs allowed to delete players' stats data (the mod's Admin mode). */
 	ADMIN_UUIDS: string;
+	/** Oldest mod version allowed to upload fights, e.g. "1.1.0". Empty = no minimum. */
+	MIN_MOD_VERSION?: string;
 }
 
 /** Fights kept per player (the most a player's page can show). */
@@ -306,6 +308,9 @@ async function ignoreLegacyUpload(request: Request, env: Env): Promise<Response>
  * MAX_FIGHTS fights is deleted. fight_key makes a retried upload a no-op.
  */
 async function uploadFight(request: Request, env: Env): Promise<Response> {
+	// Before logging in, so refusing an old mod costs no database reads.
+	const outdated = refuseOutdatedMod(request, env);
+	if (outdated) return outdated;
 	const uuid = await authenticate(request, env);
 	if (!uuid) return json({ error: "not logged in" }, 401);
 
@@ -421,16 +426,41 @@ async function uploadFight(request: Request, env: Env): Promise<Response> {
 			: insertCombo.bind(uuid, fightKey, uuid, category, enemy, enemyBroken, own, ownBroken));
 	}
 
-	// Keep only the last MAX_FIGHTS fights (children first, then the fights).
-	const kept = `SELECT id FROM fights WHERE uuid = ? ORDER BY ended_at DESC, id DESC LIMIT ${MAX_FIGHTS}`;
+	// Keep only the last MAX_FIGHTS fights (children first, then the fights). Only the fights past
+	// the limit are looked at, so this reads ~MAX_FIGHTS index rows rather than every row the player has.
+	const old = `SELECT id FROM fights WHERE uuid = ? ORDER BY ended_at DESC, id DESC LIMIT -1 OFFSET ${MAX_FIGHTS}`;
 	for (const table of ["swaps", "fight_guns", "fight_combos"]) {
-		statements.push(env.DB.prepare(`DELETE FROM ${table} WHERE uuid = ? AND fight_id NOT IN (${kept})`).bind(uuid, uuid));
+		statements.push(env.DB.prepare(`DELETE FROM ${table} WHERE fight_id IN (${old})`).bind(uuid));
 	}
-	statements.push(env.DB.prepare(`DELETE FROM fights WHERE uuid = ? AND id NOT IN (${kept})`).bind(uuid, uuid));
+	statements.push(env.DB.prepare(`DELETE FROM fights WHERE id IN (${old})`).bind(uuid));
 	statements.push(env.DB.prepare("UPDATE players SET last_seen = ? WHERE uuid = ?").bind(now, uuid));
 	await env.DB.batch(statements);
 
 	return json({ stored: 1 });
+}
+
+/**
+ * Mods older than MIN_MOD_VERSION may not upload. Versions from before the updater send no
+ * version header: they get 400, which makes them drop the fight instead of retrying forever.
+ * Newer ones get 426, keep their fights and update themselves (see the mod's Updater).
+ */
+function refuseOutdatedMod(request: Request, env: Env): Response | null {
+	const min = (env.MIN_MOD_VERSION ?? "").trim();
+	if (!min) return null;
+	const version = request.headers.get("X-GTMAddOns-Version");
+	if (version === null) return json({ error: "this GTMAddOns version is too old - update the mod" }, 400);
+	if (compareVersions(version, min) < 0) return json({ error: "update required", min_version: min }, 426);
+	return null;
+}
+
+/** Compares dotted version numbers: "1.10.0" > "1.9.2". */
+export function compareVersions(a: string, b: string): number {
+	const x = a.split(/[^0-9]+/), y = b.split(/[^0-9]+/);
+	for (let i = 0; i < Math.max(x.length, y.length); i++) {
+		const p = Number(x[i] || 0), q = Number(y[i] || 0);
+		if (p !== q) return p < q ? -1 : 1;
+	}
+	return 0;
 }
 
 /**
@@ -528,24 +558,24 @@ async function playerDetail(request: Request, env: Env, uuid: string): Promise<R
 			        COALESCE(SUM(result = 'FAILED'), 0)                   AS failures,
 			        COALESCE(SUM(result = 'CANCELED'), 0)                 AS cancels,
 			        MIN(CASE WHEN result = 'SUCCESS' THEN total_ms END)   AS best_ms
-			   FROM swaps WHERE uuid = ? AND category = 'WING' AND ${inView}`,
-		).bind(uuid, uuid),
+			   FROM swaps WHERE category = 'WING' AND ${inView}`,
+		).bind(uuid),
 		// Averages only over successful swaps, so failed/canceled ones don't skew them.
 		env.DB.prepare(
-			`SELECT ${averages} FROM swaps WHERE uuid = ? AND category = 'WING' AND result = 'SUCCESS' AND ${inView}`,
-		).bind(uuid, uuid),
+			`SELECT ${averages} FROM swaps WHERE category = 'WING' AND result = 'SUCCESS' AND ${inView}`,
+		).bind(uuid),
 		env.DB.prepare(
 			`SELECT ts, result, total_ms, wing_to_hotbar_ms, efficiency, overflick_deg
-			   FROM swaps WHERE uuid = ? AND category = 'WING' AND ${inView} ORDER BY ts DESC LIMIT 15`,
-		).bind(uuid, uuid),
+			   FROM swaps WHERE category = 'WING' AND ${inView} ORDER BY ts DESC LIMIT 15`,
+		).bind(uuid),
 		env.DB.prepare(
 			`SELECT g.category, g.gun, SUM(g.shots) AS shots, SUM(g.hits) AS hits, SUM(g.headshots) AS headshots,
 			        SUM(g.kills) AS kills, MAX(f.ended_at) AS last_used
 			   FROM fight_guns g JOIN fights f ON f.id = g.fight_id
-			  WHERE g.uuid = ? AND g.${inView}
+			  WHERE g.${inView}
 			  GROUP BY g.category, g.gun
 			  ORDER BY shots DESC LIMIT 80`,
-		).bind(uuid, uuid),
+		).bind(uuid),
 		// Air PvP swaps per type; failed/canceled attempts have no type and group as null.
 		env.DB.prepare(
 			`SELECT swap_type,
@@ -554,17 +584,17 @@ async function playerDetail(request: Request, env: Env, uuid: string): Promise<R
 			        COALESCE(SUM(result = 'CANCELED'), 0)                 AS cancels,
 			        AVG(CASE WHEN result = 'SUCCESS' THEN total_ms END)   AS avg_ms,
 			        MIN(CASE WHEN result = 'SUCCESS' THEN total_ms END)   AS best_ms
-			   FROM swaps WHERE uuid = ? AND category = 'AIR' AND ${inView}
+			   FROM swaps WHERE category = 'AIR' AND ${inView}
 			  GROUP BY swap_type`,
-		).bind(uuid, uuid),
+		).bind(uuid),
 		env.DB.prepare(
 			`SELECT category, SUM(enemy_combos) AS enemy_combos, SUM(enemy_broken) AS enemy_broken,
 			        SUM(own_combos) AS own_combos, SUM(own_broken) AS own_broken,
 			        ${firstHits ? "COALESCE(SUM(enemy_first_hits), 0)" : "0"} AS enemy_first_hits,
 			        ${firstHits ? "COALESCE(SUM(own_first_hits), 0)" : "0"} AS own_first_hits
-			   FROM fight_combos WHERE uuid = ? AND ${inView}
+			   FROM fight_combos WHERE ${inView}
 			  GROUP BY category`,
-		).bind(uuid, uuid),
+		).bind(uuid),
 		// The last few fights in the view, newest first, for the fights strip.
 		env.DB.prepare(
 			`SELECT outcome, opponent, started_at, ended_at
@@ -575,9 +605,9 @@ async function playerDetail(request: Request, env: Env, uuid: string): Promise<R
 		env.DB.prepare(
 			`SELECT gun, SUM(speed_shots) AS shots, SUM(speed_total_bps) / SUM(speed_shots) AS avg_bps,
 			        MAX(speed_best_bps) AS best_bps
-			   FROM fight_guns WHERE uuid = ? AND category = 'GROUND' AND speed_shots > 0 AND ${inView}
+			   FROM fight_guns WHERE category = 'GROUND' AND speed_shots > 0 AND ${inView}
 			  GROUP BY gun ORDER BY shots DESC`,
-		).bind(uuid, uuid),
+		).bind(uuid),
 	]);
 
 	return json({
@@ -621,18 +651,18 @@ async function playerFights(request: Request, env: Env, uuid: string): Promise<R
 		).bind(uuid),
 		env.DB.prepare(
 			`SELECT fight_id, ts, result, category, swap_type, total_ms, ${METRICS.join(", ")}
-			   FROM swaps WHERE uuid = ? AND category IN ('WING', 'AIR') AND fight_id IN (${kept})
+			   FROM swaps WHERE category IN ('WING', 'AIR') AND fight_id IN (${kept})
 			  ORDER BY ts DESC LIMIT ${MAX_SWAPS_IN_FIGHT_LIST}`,
-		).bind(uuid, uuid),
+		).bind(uuid),
 		env.DB.prepare(
 			`SELECT fight_id, category, gun, shots, hits, headshots, kills, speed_shots, speed_total_bps, speed_best_bps
-			   FROM fight_guns WHERE uuid = ? AND fight_id IN (${kept})`,
-		).bind(uuid, uuid),
+			   FROM fight_guns WHERE fight_id IN (${kept})`,
+		).bind(uuid),
 		env.DB.prepare(
 			`SELECT fight_id, category, enemy_combos, enemy_broken, own_combos, own_broken,
 			        ${firstHits ? "enemy_first_hits, own_first_hits" : "NULL AS enemy_first_hits, NULL AS own_first_hits"}
-			   FROM fight_combos WHERE uuid = ? AND fight_id IN (${kept})`,
-		).bind(uuid, uuid),
+			   FROM fight_combos WHERE fight_id IN (${kept})`,
+		).bind(uuid),
 	]);
 
 	// Group the children under their fight, dropping the fight id and tidying numbers.
@@ -679,9 +709,21 @@ function roundNumbers(row: Record<string, unknown>): Record<string, unknown> {
 const MAX_OPPONENT_FILTER = 200;
 /** Most opponents listed back for the mod's opponent chooser. */
 const MAX_OPPONENTS_LISTED = 300;
-/** Leaderboards are recomputed at most this often per parameter set (per Worker instance), to spare the database. */
-const LEADERBOARD_TTL_MS = 60_000;
-const leaderboardCache = new Map<string, { at: number; body: string }>();
+/**
+ * Leaderboards are recomputed at most this often per parameter set, to spare the database. Each view
+ * is stored in the leaderboard_views table; an admin delete empties it so removed data disappears at
+ * once. Personal stats are not stored.
+ */
+const LEADERBOARD_TTL_S = 300;
+
+/** After an admin delete: stored leaderboards are dropped so the removed data disappears at once. */
+export async function clearLeaderboards(env: Env): Promise<void> {
+	try {
+		await env.DB.prepare("DELETE FROM leaderboard_views").run();
+	} catch {
+		// no table yet
+	}
+}
 
 /**
  * Everyone's stats for one PvP category, ready for the mod to rate and rank:
@@ -700,7 +742,6 @@ const leaderboardCache = new Map<string, { at: number; body: string }>();
  */
 async function leaderboard(request: Request, env: Env): Promise<Response> {
 	if (!(await authenticate(request, env))) return json({ error: "not logged in" }, 401);
-	const firstHits = await hasFirstHitColumns(env);
 
 	const params = new URL(request.url).searchParams;
 	const category = params.get("category") ?? "";
@@ -718,12 +759,19 @@ async function leaderboard(request: Request, env: Env): Promise<Response> {
 		.sort()
 		.slice(0, MAX_OPPONENT_FILTER);
 
-	const cacheKey = `${category}|${n}|${opponents.join(",")}`;
-	const cached = leaderboardCache.get(cacheKey);
-	if (cached && Date.now() - cached.at < LEADERBOARD_TTL_MS) {
-		return new Response(cached.body, { headers: { "Content-Type": "application/json" } });
-	}
+	// Every view is stored in D1 for LEADERBOARD_TTL_S (the Cache API does nothing on workers.dev),
+	// so each view's ranking queries run at most once per period, for everyone.
+	const key = `${category}|${n}|${opponents.join(",")}`;
+	const stored = await readStoredView(env, key);
+	if (stored) return new Response(stored, { headers: { "Content-Type": "application/json" } });
+	const body = await computeLeaderboard(env, category, n, opponents);
+	await storeView(env, key, body);
+	return new Response(body, { headers: { "Content-Type": "application/json" } });
+}
 
+/** The ranking queries for one leaderboard view, as the JSON the mod reads. */
+export async function computeLeaderboard(env: Env, category: string, n: number, opponents: string[]): Promise<string> {
+	const firstHits = await hasFirstHitColumns(env);
 	// category, n and the names are validated above, so they're safe to write into the SQL.
 	const opponentClause = opponents.length ? ` AND lower(opponent) IN (${opponents.map((o) => `'${o}'`).join(", ")})` : "";
 	const picked =
@@ -826,8 +874,31 @@ async function leaderboard(request: Request, env: Env): Promise<Response> {
 		players: [...byPlayer.values()].map(roundNumbers),
 		opponents: rowsOf("opponents").map((r) => ({ key: r.key, name: r.name, fights: r.fights })),
 	});
-	leaderboardCache.set(cacheKey, { at: Date.now(), body });
-	return new Response(body, { headers: { "Content-Type": "application/json" } });
+	return body;
+}
+
+export async function readStoredView(env: Env, key: string): Promise<string | null> {
+	try {
+		const row = await env.DB.prepare("SELECT body FROM leaderboard_views WHERE key = ? AND computed_at > ?")
+			.bind(key, Date.now() - LEADERBOARD_TTL_S * 1000)
+			.first<{ body: string }>();
+		return row?.body ?? null;
+	} catch {
+		return null; // table not created yet: compute every time
+	}
+}
+
+export async function storeView(env: Env, key: string, body: string): Promise<void> {
+	try {
+		const now = Date.now();
+		await env.DB.batch([
+			env.DB.prepare("INSERT OR REPLACE INTO leaderboard_views (key, body, computed_at) VALUES (?, ?, ?)").bind(key, body, now),
+			// Drop views nobody has asked for in an hour (filtered views pile up otherwise).
+			env.DB.prepare("DELETE FROM leaderboard_views WHERE computed_at < ?").bind(now - 3_600_000),
+		]);
+	} catch {
+		// see readStoredView
+	}
 }
 
 // ---- Admin: deleting stats data ----
@@ -859,7 +930,7 @@ async function adminDeletePlayerData(request: Request, env: Env, target: string)
 		env.DB.prepare("DELETE FROM fight_combos WHERE uuid = ?").bind(target),
 		env.DB.prepare("DELETE FROM fights WHERE uuid = ?").bind(target),
 	]);
-	leaderboardCache.clear();
+	await clearLeaderboards(env);
 	// The worker's log is the audit trail.
 	console.log(JSON.stringify({ event: "admin_delete_player_data", admin: auth.admin, target, name: player.name, fights: before?.n ?? 0 }));
 	return json({ deleted_fights: before?.n ?? 0 });
@@ -881,7 +952,7 @@ async function adminDeleteFight(request: Request, env: Env, target: string, figh
 		env.DB.prepare("DELETE FROM fight_combos WHERE fight_id = ?").bind(fight.id),
 		env.DB.prepare("DELETE FROM fights WHERE id = ?").bind(fight.id),
 	]);
-	leaderboardCache.clear();
+	await clearLeaderboards(env);
 	console.log(JSON.stringify({ event: "admin_delete_fight", admin: auth.admin, target, fight_key: fightKey, opponent: fight.opponent, outcome: fight.outcome, category: fight.category }));
 	return json({ deleted_fights: 1 });
 }
