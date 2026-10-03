@@ -100,24 +100,6 @@ CREATE TABLE IF NOT EXISTS fight_combos (
 
 CREATE INDEX IF NOT EXISTS fight_combos_uuid ON fight_combos (uuid);
 CREATE INDEX IF NOT EXISTS fight_combos_fight ON fight_combos (fight_id);
--- One counter the worker bumps when an admin deletes data, so cached leaderboards
--- (kept for minutes, shared across the data center) are dropped at once.
-CREATE TABLE IF NOT EXISTS leaderboard_meta (
-  k TEXT PRIMARY KEY,
-  v INTEGER NOT NULL
-);
-INSERT OR IGNORE INTO leaderboard_meta (k, v) VALUES ('version', 1);
--- Ready-made leaderboards. The worker stores the finished JSON for each (category, number of
--- fights) view with no opponent filter, so opening it costs one row read instead of the
--- whole ranking query. Rebuilt on demand once it is older than five minutes, and wiped when
--- an admin deletes data.
-CREATE TABLE IF NOT EXISTS leaderboard_snapshots (
-  category    TEXT    NOT NULL,
-  fights      INTEGER NOT NULL,
-  body        TEXT    NOT NULL,
-  computed_at INTEGER NOT NULL,
-  PRIMARY KEY (category, fights)
-);
 -- Every leaderboard view (category, number of fights, opponent filter) stored as finished JSON,
 -- replacing leaderboard_snapshots (no opponent filter only) and the Cloudflare cache, which does
 -- nothing on workers.dev. Rows unused for an hour are deleted when a view is stored.
@@ -126,3 +108,9 @@ CREATE TABLE IF NOT EXISTS leaderboard_views (
   body        TEXT    NOT NULL,
   computed_at INTEGER NOT NULL
 );
+
+CREATE INDEX IF NOT EXISTS players_last_seen ON players (last_seen);
+
+-- Every login deletes expired sessions and challenges; these keep that cheap (migration 0014).
+CREATE INDEX IF NOT EXISTS sessions_expires ON sessions (expires);
+CREATE INDEX IF NOT EXISTS challenges_expires ON challenges (expires);

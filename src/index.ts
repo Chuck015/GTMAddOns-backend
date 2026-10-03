@@ -104,11 +104,12 @@ async function route(request: Request, env: Env): Promise<Response> {
 	if (method === "POST" && pathname === "/auth/challenge") return createChallenge(env);
 	if (method === "POST" && pathname === "/auth/login") return login(request, env);
 	if (method === "GET" && pathname === "/me") return me(request, env);
+	if (method === "POST" && pathname === "/presence") return presence(request, env);
+	if (method === "GET" && pathname === "/users") return modUsers(request, env);
 	if (method === "POST" && pathname === "/fights") return uploadFight(request, env);
 	if (method === "POST" && (pathname === "/swaps" || pathname === "/guns" || pathname === "/combos")) {
 		return ignoreLegacyUpload(request, env);
 	}
-	if (method === "GET" && pathname === "/players") return listPlayers(request, env);
 
 	const player = pathname.match(/^\/players\/([0-9a-f]{32})$/);
 	if (method === "GET" && player) return playerDetail(request, env, player[1]);
@@ -267,6 +268,40 @@ async function me(request: Request, env: Env): Promise<Response> {
 	return json({ uuid, name: player?.name ?? null, dev: isDev(env, uuid), admin: isAdmin(env, uuid) });
 }
 
+// ---- Who is running the mod ----
+
+/** A player counts as running the mod if the backend heard from them (login, upload or heartbeat) this recently. */
+const PRESENCE_WINDOW_MS = 40 * 60_000;
+/** A heartbeat within this long of the last one is ignored, so nobody can turn it into a write flood. */
+const PRESENCE_MIN_GAP_MS = 60_000;
+
+/** The mod tells us it is running (about every 15 minutes while the game is open). */
+async function presence(request: Request, env: Env): Promise<Response> {
+	const uuid = await authenticate(request, env);
+	if (!uuid) return json({ error: "not logged in" }, 401);
+	const now = Date.now();
+	await env.DB.prepare("UPDATE players SET last_seen = ? WHERE uuid = ? AND last_seen < ?").bind(now, uuid, now - PRESENCE_MIN_GAP_MS).run();
+	return json({ ok: true });
+}
+
+/**
+ * The UUIDs (undashed) of players running the mod right now, for the icon next to their name. Built from
+ * players.last_seen (indexed, migration 0013) and stored for five minutes like a leaderboard view, so asking
+ * costs one row read.
+ */
+async function modUsers(request: Request, env: Env): Promise<Response> {
+	if (!(await authenticate(request, env))) return json({ error: "not logged in" }, 401);
+	const headers = { "Content-Type": "application/json" };
+	const stored = await readStoredView(env, "mod-users");
+	if (stored) return new Response(stored, { headers });
+	const { results } = await env.DB.prepare("SELECT uuid FROM players WHERE last_seen >= ?")
+		.bind(Date.now() - PRESENCE_WINDOW_MS)
+		.all<{ uuid: string }>();
+	const body = JSON.stringify({ uuids: results.map((r) => r.uuid) });
+	await storeView(env, "mod-users", body);
+	return new Response(body, { headers });
+}
+
 /** Admin mode (deleting players' stats data) is limited to these accounts. Checked again on every admin request. */
 function isAdmin(env: Env, uuid: string): boolean {
 	return (env.ADMIN_UUIDS ?? "")
@@ -277,24 +312,6 @@ function isAdmin(env: Env, uuid: string): boolean {
 }
 
 // ---- Uploads ----
-
-/**
- * Whether fight_combos has the first-hit columns (migration 0008_first_hits.sql). A
- * database that hasn't had that migration applied still works: first hits just aren't
- * stored or reported until it is. Once the columns exist the answer is remembered; while
- * they don't, it's re-checked every few minutes so applying the migration takes effect
- * without a redeploy.
- */
-let firstHitColumns: { checkedAt: number; present: boolean } | null = null;
-async function hasFirstHitColumns(env: Env): Promise<boolean> {
-	const now = Date.now();
-	if (firstHitColumns && (firstHitColumns.present || now - firstHitColumns.checkedAt < 5 * 60_000)) return firstHitColumns.present;
-	const { results } = await env.DB.prepare("SELECT name FROM pragma_table_info('fight_combos')").all<{ name: string }>();
-	const names = new Set(results.map((r) => r.name));
-	const present = names.has("enemy_first_hits") && names.has("own_first_hits");
-	firstHitColumns = { checkedAt: now, present };
-	return present;
-}
 
 /** Older mod versions still send these; accept and drop, so they don't retry forever. */
 async function ignoreLegacyUpload(request: Request, env: Env): Promise<Response> {
@@ -396,14 +413,10 @@ async function uploadFight(request: Request, env: Env): Promise<Response> {
 			hasSpeed ? speedShots : null, hasSpeed ? speedTotal : null, hasSpeed ? speedBest : null));
 	}
 
-	const firstHits = await hasFirstHitColumns(env);
 	const insertCombo = env.DB.prepare(
-		firstHits
-			? `INSERT INTO fight_combos (fight_id, uuid, category, enemy_combos, enemy_broken, own_combos, own_broken,
-			                          enemy_first_hits, own_first_hits)
-			   VALUES (${fightId}, ?, ?, ?, ?, ?, ?, ?, ?)`
-			: `INSERT INTO fight_combos (fight_id, uuid, category, enemy_combos, enemy_broken, own_combos, own_broken)
-			   VALUES (${fightId}, ?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO fight_combos (fight_id, uuid, category, enemy_combos, enemy_broken, own_combos, own_broken,
+		                          enemy_first_hits, own_first_hits)
+		 VALUES (${fightId}, ?, ?, ?, ?, ?, ?, ?, ?)`,
 	);
 	const comboCategories = new Set<string>();
 	for (const raw of combos) {
@@ -419,11 +432,9 @@ async function uploadFight(request: Request, env: Env): Promise<Response> {
 		// versions don't send them (null); bad values are dropped, not rejected.
 		const enemyFirst = countOrNull(c.enemy_first_hits);
 		const ownFirst = countOrNull(c.own_first_hits);
-		statements.push(firstHits
-			? insertCombo.bind(uuid, fightKey, uuid, category, enemy, enemyBroken, own, ownBroken,
-				enemyFirst !== null && enemyFirst <= enemy ? enemyFirst : null,
-				ownFirst !== null && ownFirst <= own ? ownFirst : null)
-			: insertCombo.bind(uuid, fightKey, uuid, category, enemy, enemyBroken, own, ownBroken));
+		statements.push(insertCombo.bind(uuid, fightKey, uuid, category, enemy, enemyBroken, own, ownBroken,
+			enemyFirst !== null && enemyFirst <= enemy ? enemyFirst : null,
+			ownFirst !== null && ownFirst <= own ? ownFirst : null));
 	}
 
 	// Keep only the last MAX_FIGHTS fights (children first, then the fights). Only the fights past
@@ -485,8 +496,7 @@ function clampTs(ts: number, now: number): number {
 }
 
 // ---- Viewing stats ----
-// Each player's last MAX_FIGHTS fights are stored. The list shows every
-// player over their last DEFAULT_VIEW fights; a player's page asks for
+// Each player's last MAX_FIGHTS fights are stored. A player's page asks for
 // their last 25, 50 or 100 fights of one PvP category
 // (?fights=N&category=JP), so each tab is over that kind of fight.
 
@@ -495,42 +505,13 @@ function clampTs(ts: number, now: number): number {
  * `fight_id IN (...)`. Binds the uuid. category must already be checked
  * against CATEGORIES - it's written into the SQL.
  */
-function lastFights(n: number, uuidColumn = "?", category: string | null = null): string {
+function lastFights(n: number, category: string | null = null): string {
 	const only = category !== null && CATEGORIES.has(category) ? ` AND f.category = '${category}'` : "";
-	return `SELECT f.id FROM fights f WHERE f.uuid = ${uuidColumn}${only} ORDER BY f.ended_at DESC, f.id DESC LIMIT ${n}`;
-}
-
-async function listPlayers(request: Request, env: Env): Promise<Response> {
-	if (!(await authenticate(request, env))) return json({ error: "not logged in" }, 401);
-
-	const recent = lastFights(DEFAULT_VIEW, "p.uuid");
-	const { results } = await env.DB.prepare(
-		`SELECT p.uuid, p.name, p.last_seen,
-		        COUNT(s.id)                                              AS total,
-		        COALESCE(SUM(s.result = 'SUCCESS'), 0)                   AS successes,
-		        COALESCE(SUM(s.result = 'FAILED'), 0)                    AS failures,
-		        COALESCE(SUM(s.result = 'CANCELED'), 0)                  AS cancels,
-		        AVG(CASE WHEN s.result = 'SUCCESS' THEN s.total_ms END)  AS avg_ms,
-		        MIN(CASE WHEN s.result = 'SUCCESS' THEN s.total_ms END)  AS best_ms,
-		        (SELECT COALESCE(SUM(shots), 0)     FROM fight_guns g WHERE g.fight_id IN (${recent})) AS shots,
-		        (SELECT COALESCE(SUM(hits), 0)      FROM fight_guns g WHERE g.fight_id IN (${recent})) AS hits,
-		        (SELECT COALESCE(SUM(headshots), 0) FROM fight_guns g WHERE g.fight_id IN (${recent})) AS headshots,
-		        (SELECT COUNT(*) FROM (${recent}))                                                    AS fights,
-		        (SELECT COALESCE(SUM(outcome = 'KILL'), 0) FROM fights k WHERE k.id IN (${recent}))  AS kills,
-		        (SELECT COALESCE(SUM(outcome = 'DEATH'), 0) FROM fights k WHERE k.id IN (${recent})) AS deaths
-		   FROM players p
-		   LEFT JOIN swaps s ON s.uuid = p.uuid AND s.category = 'WING' AND s.fight_id IN (${recent})
-		  GROUP BY p.uuid
-		  ORDER BY p.last_seen DESC
-		  LIMIT 500`,
-	).all();
-	return json({ players: results });
+	return `SELECT f.id FROM fights f WHERE f.uuid = ?${only} ORDER BY f.ended_at DESC, f.id DESC LIMIT ${n}`;
 }
 
 async function playerDetail(request: Request, env: Env, uuid: string): Promise<Response> {
 	if (!(await authenticate(request, env))) return json({ error: "not logged in" }, 401);
-	const firstHits = await hasFirstHitColumns(env);
-
 	const player = await env.DB.prepare("SELECT uuid, name, first_seen, last_seen FROM players WHERE uuid = ?")
 		.bind(uuid)
 		.first();
@@ -542,7 +523,7 @@ async function playerDetail(request: Request, env: Env, uuid: string): Promise<R
 	const askedCategory = params.get("category");
 	const category = askedCategory !== null && CATEGORIES.has(askedCategory) ? askedCategory : null;
 	// Every query below is limited to these fights; each use binds the uuid once more.
-	const inView = `fight_id IN (${lastFights(n, "?", category)})`;
+	const inView = `fight_id IN (${lastFights(n, category)})`;
 
 	const averages = ["total_ms", ...METRICS].map((m) => `AVG(${m}) AS ${m}`).join(", ");
 	const [fights, counts, avg, recent, guns, airSwaps, combos, recentFights, movementGuns] = await env.DB.batch([
@@ -550,7 +531,7 @@ async function playerDetail(request: Request, env: Env, uuid: string): Promise<R
 			`SELECT COUNT(*)                              AS fights,
 			        COALESCE(SUM(outcome = 'KILL'), 0)    AS kills,
 			        COALESCE(SUM(outcome = 'DEATH'), 0)   AS deaths
-			   FROM fights WHERE id IN (${lastFights(n, "?", category)})`,
+			   FROM fights WHERE id IN (${lastFights(n, category)})`,
 		).bind(uuid),
 		env.DB.prepare(
 			`SELECT COUNT(*)                                              AS total,
@@ -590,15 +571,15 @@ async function playerDetail(request: Request, env: Env, uuid: string): Promise<R
 		env.DB.prepare(
 			`SELECT category, SUM(enemy_combos) AS enemy_combos, SUM(enemy_broken) AS enemy_broken,
 			        SUM(own_combos) AS own_combos, SUM(own_broken) AS own_broken,
-			        ${firstHits ? "COALESCE(SUM(enemy_first_hits), 0)" : "0"} AS enemy_first_hits,
-			        ${firstHits ? "COALESCE(SUM(own_first_hits), 0)" : "0"} AS own_first_hits
+			        COALESCE(SUM(enemy_first_hits), 0) AS enemy_first_hits,
+			        COALESCE(SUM(own_first_hits), 0) AS own_first_hits
 			   FROM fight_combos WHERE ${inView}
 			  GROUP BY category`,
 		).bind(uuid),
 		// The last few fights in the view, newest first, for the fights strip.
 		env.DB.prepare(
 			`SELECT outcome, opponent, started_at, ended_at
-			   FROM fights WHERE id IN (${lastFights(n, "?", category)})
+			   FROM fights WHERE id IN (${lastFights(n, category)})
 			  ORDER BY ended_at DESC, id DESC LIMIT 10`,
 		).bind(uuid),
 		// Ground PvP movement guns: horizontal speed right after their shots, per gun.
@@ -636,8 +617,6 @@ const MAX_SWAPS_IN_FIGHT_LIST = 5000;
  */
 async function playerFights(request: Request, env: Env, uuid: string): Promise<Response> {
 	if (!(await authenticate(request, env))) return json({ error: "not logged in" }, 401);
-	const firstHits = await hasFirstHitColumns(env);
-
 	const player = await env.DB.prepare("SELECT uuid, name, first_seen, last_seen FROM players WHERE uuid = ?")
 		.bind(uuid)
 		.first();
@@ -660,7 +639,7 @@ async function playerFights(request: Request, env: Env, uuid: string): Promise<R
 		).bind(uuid),
 		env.DB.prepare(
 			`SELECT fight_id, category, enemy_combos, enemy_broken, own_combos, own_broken,
-			        ${firstHits ? "enemy_first_hits, own_first_hits" : "NULL AS enemy_first_hits, NULL AS own_first_hits"}
+			        enemy_first_hits, own_first_hits
 			   FROM fight_combos WHERE fight_id IN (${kept})`,
 		).bind(uuid),
 	]);
@@ -771,7 +750,6 @@ async function leaderboard(request: Request, env: Env): Promise<Response> {
 
 /** The ranking queries for one leaderboard view, as the JSON the mod reads. */
 export async function computeLeaderboard(env: Env, category: string, n: number, opponents: string[]): Promise<string> {
-	const firstHits = await hasFirstHitColumns(env);
 	// category, n and the names are validated above, so they're safe to write into the SQL.
 	const opponentClause = opponents.length ? ` AND lower(opponent) IN (${opponents.map((o) => `'${o}'`).join(", ")})` : "";
 	const picked =
@@ -837,8 +815,8 @@ export async function computeLeaderboard(env: Env, category: string, n: number, 
 		statements.push(env.DB.prepare(
 			`${picked} SELECT c.uuid, c.category, SUM(c.enemy_combos) AS enemy_combos, SUM(c.enemy_broken) AS enemy_broken,
 			        SUM(c.own_combos) AS own_combos, SUM(c.own_broken) AS own_broken,
-			        ${firstHits ? "COALESCE(SUM(c.enemy_first_hits), 0)" : "0"} AS enemy_first_hits,
-			        ${firstHits ? "COALESCE(SUM(c.own_first_hits), 0)" : "0"} AS own_first_hits
+			        COALESCE(SUM(c.enemy_first_hits), 0) AS enemy_first_hits,
+			        COALESCE(SUM(c.own_first_hits), 0) AS own_first_hits
 			   FROM fight_combos c JOIN picked p ON p.id = c.fight_id WHERE c.category = '${category}' GROUP BY c.uuid, c.category`,
 		));
 	}
