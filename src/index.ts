@@ -14,14 +14,15 @@
  *   POST /fights                { fight_key, started_at, ended_at, outcome, opponent, category,
  *                                 swaps: [...], guns: [...], combos: [...] } (logged in)
  *   GET  /players               -> player summaries        (logged in)
- *   GET  /players/:uuid/fights -> one player's last MAX_FIGHTS fights, raw, newest first (logged in)
+ *   GET  /players/:uuid/fights -> one player's last MAX_FIGHTS fights per category, raw, newest first (logged in)
  *   GET  /players/:uuid?fights=N&category=C -> one player's full stats over their last N
  *                               (25/50/100) fights of PvP category C, or all fights without it (logged in)
  *
  * Stats are only recorded during fights: from GTM's combat tag starting to
  * the player's kill or death. The mod uploads each finished fight in one
- * go, and only each player's last MAX_FIGHTS fights are kept - older ones
- * are deleted as new ones arrive. Stats are shown over the last 25, 50 or
+ * go, and only each player's last MAX_FIGHTS fights of each PvP category are
+ * kept - older ones are deleted as new ones arrive, so a day of Air fights
+ * doesn't push out Wing history. Stats are shown over the last 25, 50 or
  * 100 of those.
  *
  * Gun stats come as totals per gun for the fight rather than one row per
@@ -43,6 +44,7 @@ export interface Env {
 }
 
 /** Fights kept per player (the most a player's page can show). */
+/** Fights kept per player, per PvP category. */
 const MAX_FIGHTS = 100;
 /** How many of a player's last fights their page can show (?fights=N). */
 const FIGHT_VIEWS = [25, 50, 100];
@@ -322,7 +324,7 @@ async function ignoreLegacyUpload(request: Request, env: Env): Promise<Response>
 /**
  * One finished fight: its swaps, gun totals and combo totals, stored in a
  * single transaction. Then anything older than the player's last
- * MAX_FIGHTS fights is deleted. fight_key makes a retried upload a no-op.
+ * MAX_FIGHTS fights of that category is deleted. fight_key makes a retried upload a no-op.
  */
 async function uploadFight(request: Request, env: Env): Promise<Response> {
 	// Before logging in, so refusing an old mod costs no database reads.
@@ -437,13 +439,14 @@ async function uploadFight(request: Request, env: Env): Promise<Response> {
 			ownFirst !== null && ownFirst <= own ? ownFirst : null));
 	}
 
-	// Keep only the last MAX_FIGHTS fights (children first, then the fights). Only the fights past
-	// the limit are looked at, so this reads ~MAX_FIGHTS index rows rather than every row the player has.
-	const old = `SELECT id FROM fights WHERE uuid = ? ORDER BY ended_at DESC, id DESC LIMIT -1 OFFSET ${MAX_FIGHTS}`;
+	// Keep only the last MAX_FIGHTS fights of this category (children first, then the fights). Only the
+	// fights past the limit are looked at, so this reads ~MAX_FIGHTS index rows (fights_uuid_category_ended)
+	// rather than every row the player has.
+	const old = `SELECT id FROM fights WHERE uuid = ? AND category = ? ORDER BY ended_at DESC, id DESC LIMIT -1 OFFSET ${MAX_FIGHTS}`;
 	for (const table of ["swaps", "fight_guns", "fight_combos"]) {
-		statements.push(env.DB.prepare(`DELETE FROM ${table} WHERE fight_id IN (${old})`).bind(uuid));
+		statements.push(env.DB.prepare(`DELETE FROM ${table} WHERE fight_id IN (${old})`).bind(uuid, category));
 	}
-	statements.push(env.DB.prepare(`DELETE FROM fights WHERE id IN (${old})`).bind(uuid));
+	statements.push(env.DB.prepare(`DELETE FROM fights WHERE id IN (${old})`).bind(uuid, category));
 	statements.push(env.DB.prepare("UPDATE players SET last_seen = ? WHERE uuid = ?").bind(now, uuid));
 	await env.DB.batch(statements);
 
@@ -496,7 +499,7 @@ function clampTs(ts: number, now: number): number {
 }
 
 // ---- Viewing stats ----
-// Each player's last MAX_FIGHTS fights are stored. A player's page asks for
+// Each player's last MAX_FIGHTS fights of each category are stored. A player's page asks for
 // their last 25, 50 or 100 fights of one PvP category
 // (?fights=N&category=JP), so each tab is over that kind of fight.
 
@@ -609,7 +612,7 @@ async function playerDetail(request: Request, env: Env, uuid: string): Promise<R
 const MAX_SWAPS_IN_FIGHT_LIST = 5000;
 
 /**
- * One player's last MAX_FIGHTS fights, newest first, each with its own swaps,
+ * One player's last MAX_FIGHTS fights of each category, newest first, each with its own swaps,
  * gun totals and combo totals - the raw material for the fight log, per-fight
  * ratings and custom filters (fight count, opponents), which the mod works out
  * itself. Only Wing and Air swaps are sent (the only ones ever shown). Numbers
@@ -622,7 +625,8 @@ async function playerFights(request: Request, env: Env, uuid: string): Promise<R
 		.first();
 	if (!player) return json({ error: "no such player" }, 404);
 
-	const kept = `SELECT id FROM fights WHERE uuid = ? ORDER BY ended_at DESC, id DESC LIMIT ${MAX_FIGHTS}`;
+	const kept = `SELECT id FROM (SELECT id, ROW_NUMBER() OVER (PARTITION BY category ORDER BY ended_at DESC, id DESC) AS rn
+		FROM fights WHERE uuid = ?) WHERE rn <= ${MAX_FIGHTS}`;
 	const [fights, swaps, guns, combos] = await env.DB.batch([
 		env.DB.prepare(
 			`SELECT id, fight_key, started_at, ended_at, outcome, opponent, category
