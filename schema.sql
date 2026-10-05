@@ -62,7 +62,19 @@ CREATE TABLE IF NOT EXISTS swaps (
 	overflick_peak_deg REAL,
 	after_deg          REAL,
 	speed_before_bps   REAL,              -- momentum: horizontal blocks/s at inventory open...
-	speed_after_bps    REAL               -- ...and at close (Wing swaps into an empty hotbar slot)
+	speed_after_bps    REAL,              -- ...and at close (Wing swaps into an empty hotbar slot)
+	-- how the inventory opened (migration 0017; see the migration for the meaning)
+	cursor_dx          REAL,
+	cursor_dy          REAL,
+	direct_px          REAL,
+	approach_px        REAL,
+	gui_x              REAL,
+	gui_y              REAL,
+	scaled_w           REAL,
+	scaled_h           REAL,
+	gui_scale          REAL,
+	creative           REAL,
+	from_screen        REAL
 );
 
 CREATE INDEX IF NOT EXISTS swaps_uuid_ts ON swaps (uuid, ts);

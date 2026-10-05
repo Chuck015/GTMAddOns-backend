@@ -88,6 +88,9 @@ const METRICS = [
 	"speed_after_bps",
 ] as const;
 
+// How the inventory opened (see migration 0017). Stored with every swap but not part of METRICS, so the stats views don't read them.
+const INPUT_METRICS = ["cursor_dx", "cursor_dy", "direct_px", "approach_px", "gui_x", "gui_y", "scaled_w", "scaled_h", "gui_scale", "creative", "from_screen"] as const;
+
 export default {
 	async fetch(request, env): Promise<Response> {
 		try {
@@ -386,7 +389,7 @@ async function uploadFight(request: Request, env: Env): Promise<Response> {
 		).bind(uuid, fightKey, startedAt, endedAt, outcome, opponent, category),
 	];
 
-	const swapColumns = ["uuid", "ts", "result", "category", "swap_type", "total_ms", ...METRICS];
+	const swapColumns = ["uuid", "ts", "result", "category", "swap_type", "total_ms", ...METRICS, ...INPUT_METRICS];
 	const insertSwap = env.DB.prepare(
 		`INSERT INTO swaps (fight_id, ${swapColumns.join(", ")}) VALUES (${fightId}, ${swapColumns.map(() => "?").join(", ")})`,
 	);
@@ -401,7 +404,7 @@ async function uploadFight(request: Request, env: Env): Promise<Response> {
 		}
 		const ts = clampTs(finiteOrNull(s.ts) ?? now, now);
 		statements.push(insertSwap.bind(uuid, fightKey, uuid, ts, s.result, s.category, swapType, totalMs,
-			...METRICS.map((m) => finiteOrNull(s[m]))));
+			...METRICS.map((m) => finiteOrNull(s[m])), ...INPUT_METRICS.map((m) => finiteOrNull(s[m]))));
 	}
 
 	const insertGun = env.DB.prepare(
@@ -1147,6 +1150,54 @@ interface SwapFlagRow {
 }
 interface GunFlagRow { gun: string; shots: number; hits: number; headshots: number }
 interface Flag { level: "warn" | "note"; text: string }
+interface InputRow {
+	category: string; cursor_dx: number; cursor_dy: number; direct_px: number | null; approach_px: number | null;
+	gui_x: number; gui_y: number; scaled_w: number; scaled_h: number; gui_scale: number; creative: number; from_screen: number;
+}
+
+/**
+ * Where vanilla puts the survival inventory (InventoryScreen / RecipeBookWidget.findLeftEdge): y is centred; x is centred when the
+ * recipe book is closed (or the window is narrow, under 379 scaled px) and shifted right by the open book otherwise.
+ */
+export function vanillaInventoryPosition(scaledW: number, scaledH: number): { y: number; closedX: number; bookX: number } {
+	const closedX = Math.floor((scaledW - 176) / 2);
+	return { y: Math.floor((scaledH - 166) / 2), closedX, bookX: scaledW < 379 ? closedX : 177 + Math.floor((scaledW - 176 - 200) / 2) };
+}
+
+/**
+ * Input tricks, from how the inventory opened (pixels, so none of this depends on mouse sensitivity). Only survival-inventory swaps
+ * that opened from gameplay count, and at least 10 of them. Vanilla puts the cursor exactly on the window centre and the inventory
+ * in one of two places (recipe book closed or open, which legally puts the cursor beside the lower armor slots), so:
+ *  - the cursor not on the centre (more than 3 px off) means the game's cursor reset was bypassed;
+ *  - the inventory not where vanilla draws it (e.g. moved down by a mod to put the slot under the cursor);
+ *  - the cursor already on (or within 12 scaled px of) the slot at open, which the recipe book never does;
+ *  - a cursor path to the slot shorter than half the straight line, or no movement at all although the slot was far away.
+ */
+export function inputFlags(rows: InputRow[]): Flag[] {
+	const flags: Flag[] = [];
+	const mine = rows.filter((r) => r.creative === 0 && r.from_screen === 0 && Number.isFinite(r.gui_scale) && r.gui_scale > 0);
+	if (mine.length < 10) return flags;
+	let book = 0;
+	for (const r of mine) {
+		const v = vanillaInventoryPosition(r.scaled_w, r.scaled_h);
+		if (Math.abs(r.gui_x - v.bookX) <= 3 && Math.abs(r.gui_x - v.closedX) > 3) book++;
+	}
+	const rule = (count: number, text: string) => {
+		if (count >= 3 && count / mine.length >= 0.05) flags.push({ level: "warn", text: `${text} on ${count} of ${mine.length} swaps` });
+	};
+	rule(mine.filter((r) => Math.hypot(r.cursor_dx, r.cursor_dy) > 3).length, "The cursor did not start at the window centre (more than 3 px off)");
+	rule(mine.filter((r) => {
+		const v = vanillaInventoryPosition(r.scaled_w, r.scaled_h);
+		return Math.abs(r.gui_y - v.y) > 3 || (Math.abs(r.gui_x - v.closedX) > 3 && Math.abs(r.gui_x - v.bookX) > 3);
+	}).length, "The inventory was not where vanilla draws it");
+	rule(mine.filter((r) => r.direct_px !== null && r.direct_px < 12 * r.gui_scale).length, "The cursor started on the chest slot (within 12 scaled px)");
+	rule(mine.filter((r) => r.direct_px !== null && r.approach_px !== null && r.direct_px >= 40 && r.approach_px < 0.5 * r.direct_px).length,
+		"The cursor's path to the slot was under half the straight-line distance");
+	const scales = [...new Set(mine.map((r) => r.gui_scale))].sort((a, b) => a - b);
+	flags.push({ level: "note", text: `Recipe book open on ${book} of ${mine.length} swaps (GUI scale ${scales.join(", ")})` });
+	return flags;
+}
+
 interface CursorRow { category: string; needed_deg: number; approach_deg: number | null; reach_ms: number | null }
 
 /**
@@ -1247,7 +1298,7 @@ async function adminPlayerInfo(request: Request, env: Env): Promise<Response> {
 	}
 	if (!player) return json({ error: "no such player" }, 404);
 
-	const [byCategory, last, swaps, swapStats, gunStats, cursorRows] = await env.DB.batch([
+	const [byCategory, last, swaps, swapStats, gunStats, cursorRows, inputRows] = await env.DB.batch([
 		env.DB.prepare(
 			`SELECT category, COUNT(*) AS fights, COALESCE(SUM(outcome = 'KILL'), 0) AS kills, COALESCE(SUM(outcome = 'DEATH'), 0) AS deaths
 			   FROM fights WHERE uuid = ? GROUP BY category`,
@@ -1269,7 +1320,11 @@ async function adminPlayerInfo(request: Request, env: Env): Promise<Response> {
 		// For the cursor flags: how each successful swap's cursor travelled (at most a few hundred rows).
 		env.DB.prepare(
 			`SELECT category, needed_deg, approach_deg, reach_ms FROM swaps
-			  WHERE uuid = ? AND result = 'SUCCESS' AND category IN ('WING', 'AIR') AND needed_deg IS NOT NULL`,
+				  WHERE uuid = ? AND result = 'SUCCESS' AND category IN ('WING', 'AIR') AND needed_deg IS NOT NULL`,
+		).bind(player.uuid),
+		// For the input flags: how the inventory opened in the player's latest swaps (the mod records this since 1.4.0).
+		env.DB.prepare(
+			`SELECT category, ${INPUT_METRICS.join(", ")} FROM swaps WHERE uuid = ? AND cursor_dx IS NOT NULL ORDER BY ts DESC LIMIT 300`,
 		).bind(player.uuid),
 	]);
 	const categories = (byCategory.results ?? []) as { category: string | null; fights: number; kills: number; deaths: number }[];
@@ -1297,7 +1352,7 @@ async function adminPlayerInfo(request: Request, env: Env): Promise<Response> {
 		fights_by_category: fightsByCategory,
 		last_fight_at: ((last.results?.[0] as { last_fight_at: number | null } | undefined)?.last_fight_at) ?? null,
 		swaps: ((swaps.results?.[0] as { swaps: number } | undefined)?.swaps) ?? 0,
-		flags: [...playerFlags(swapStats.results as SwapFlagRow[], gunStats.results as GunFlagRow[], fights, kills, deaths), ...cursorFlags(cursorRows.results as CursorRow[])],
+		flags: [...playerFlags(swapStats.results as SwapFlagRow[], gunStats.results as GunFlagRow[], fights, kills, deaths), ...cursorFlags(cursorRows.results as CursorRow[]), ...inputFlags(inputRows.results as InputRow[])],
 	});
 }
 
