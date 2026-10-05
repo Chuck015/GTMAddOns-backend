@@ -567,7 +567,10 @@ async function playerDetail(request: Request, env: Env, uuid: string): Promise<R
 			        COALESCE(SUM(result = 'SUCCESS'), 0)                  AS successes,
 			        COALESCE(SUM(result = 'CANCELED'), 0)                 AS cancels,
 			        AVG(CASE WHEN result = 'SUCCESS' THEN total_ms END)   AS avg_ms,
-			        MIN(CASE WHEN result = 'SUCCESS' THEN total_ms END)   AS best_ms
+			        MIN(CASE WHEN result = 'SUCCESS' THEN total_ms END)   AS best_ms,
+			        AVG(CASE WHEN result = 'SUCCESS' AND speed_after_bps IS NOT NULL THEN speed_before_bps END) AS speed_before_bps,
+			        AVG(CASE WHEN result = 'SUCCESS' AND speed_before_bps IS NOT NULL THEN speed_after_bps END) AS speed_after_bps,
+			        COALESCE(SUM(result = 'SUCCESS' AND speed_before_bps IS NOT NULL AND speed_after_bps IS NOT NULL), 0) AS momentum_swaps
 			   FROM swaps WHERE category = 'AIR' AND ${inView}
 			  GROUP BY swap_type`,
 		).bind(uuid),
@@ -802,7 +805,10 @@ export async function computeLeaderboard(env: Env, category: string, n: number, 
 			`${picked} SELECT s.uuid, s.swap_type, COUNT(*) AS total,
 			        COALESCE(SUM(s.result = 'SUCCESS'), 0) AS successes, COALESCE(SUM(s.result = 'CANCELED'), 0) AS cancels,
 			        AVG(CASE WHEN s.result = 'SUCCESS' THEN s.total_ms END) AS avg_ms,
-			        MIN(CASE WHEN s.result = 'SUCCESS' THEN s.total_ms END) AS best_ms
+			        MIN(CASE WHEN s.result = 'SUCCESS' THEN s.total_ms END) AS best_ms,
+			        AVG(CASE WHEN s.result = 'SUCCESS' AND s.speed_after_bps IS NOT NULL THEN s.speed_before_bps END) AS speed_before_bps,
+			        AVG(CASE WHEN s.result = 'SUCCESS' AND s.speed_before_bps IS NOT NULL THEN s.speed_after_bps END) AS speed_after_bps,
+			        COALESCE(SUM(s.result = 'SUCCESS' AND s.speed_before_bps IS NOT NULL AND s.speed_after_bps IS NOT NULL), 0) AS momentum_swaps
 			   FROM swaps s JOIN picked p ON p.id = s.fight_id WHERE s.category = 'AIR' GROUP BY s.uuid, s.swap_type`,
 		));
 	} else if (category === "GROUND") {
@@ -814,7 +820,8 @@ export async function computeLeaderboard(env: Env, category: string, n: number, 
 			  WHERE g.category = 'GROUND' AND g.speed_shots > 0 GROUP BY g.uuid, g.gun`,
 		));
 	}
-	if (category === "JP" || category === "AIR") {
+	{
+		// Every category: melee counts inside Aim for Wing, Air and Ground, and is the JP melee rating.
 		labels.push("combos");
 		statements.push(env.DB.prepare(
 			`${picked} SELECT c.uuid, c.category, SUM(c.enemy_combos) AS enemy_combos, SUM(c.enemy_broken) AS enemy_broken,
