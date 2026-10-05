@@ -1147,6 +1147,42 @@ interface SwapFlagRow {
 }
 interface GunFlagRow { gun: string; shots: number; hits: number; headshots: number }
 interface Flag { level: "warn" | "note"; text: string }
+interface CursorRow { category: string; needed_deg: number; approach_deg: number | null; reach_ms: number | null }
+
+/**
+ * Cursor tricks (see the comment above FLAG_FAST_SWAP_MS for the sample-size idea). In vanilla the cursor starts at the centre of the
+ * screen each time the inventory opens, so the distance it must travel to the chest slot (needed_deg) is nearly the same on every swap
+ * of a player (it differs between players with window size, GUI scale and sensitivity: 1.7-8.2 degrees so far). So:
+ *  - swaps that needed much less travel than this player's usual (under 30% of their median) mean the cursor did not start in the
+ *    centre but on or near the slot (a bug, a mod that keeps the cursor, a macro...);
+ *  - reaching the slot in under 25 ms (the quickest real one is 40 ms);
+ *  - a path to the slot shorter than half the straight line is not possible with a real mouse.
+ * Changing window size or GUI scale between swaps can also move the typical value, hence "check".
+ */
+export function cursorFlags(rows: CursorRow[]): Flag[] {
+	const flags: Flag[] = [];
+	for (const category of ["WING", "AIR"]) {
+		const mine = rows.filter((r) => r.category === category);
+		const label = category === "WING" ? "Wing" : "Air";
+		if (mine.length < 15) continue;
+		const needed = mine.map((r) => r.needed_deg).sort((a, b) => a - b);
+		const median = needed[Math.floor(needed.length / 2)];
+		const close = mine.filter((r) => r.needed_deg < 0.3 * median);
+		if (close.length >= 3 && close.length / mine.length >= 0.05) {
+			const least = Math.min(...close.map((r) => r.needed_deg));
+			flags.push({ level: "warn", text: `${label}: the cursor started near the chest slot on ${close.length} of ${mine.length} swaps (needed ${least.toFixed(1)}\u00B0 vs usually ${median.toFixed(1)}\u00B0; check window size changes)` });
+		}
+		const instant = mine.filter((r) => r.reach_ms !== null && r.reach_ms < 25);
+		if (instant.length >= 3) {
+			flags.push({ level: "warn", text: `${label}: the cursor reached the slot in under 25 ms on ${instant.length} of ${mine.length} swaps (quickest real: 40 ms)` });
+		}
+		const shortPath = mine.filter((r) => r.approach_deg !== null && r.needed_deg >= 1 && r.approach_deg < 0.5 * r.needed_deg);
+		if (shortPath.length >= 3 && shortPath.length / mine.length >= 0.05) {
+			flags.push({ level: "warn", text: `${label}: the cursor's path to the slot was under half the straight-line distance on ${shortPath.length} of ${mine.length} swaps` });
+		}
+	}
+	return flags;
+}
 
 export function playerFlags(swaps: SwapFlagRow[], guns: GunFlagRow[], fights: number, kills: number, deaths: number): Flag[] {
 	const flags: Flag[] = [];
@@ -1209,7 +1245,7 @@ async function adminPlayerInfo(request: Request, env: Env): Promise<Response> {
 	}
 	if (!player) return json({ error: "no such player" }, 404);
 
-	const [byCategory, last, swaps, swapStats, gunStats] = await env.DB.batch([
+	const [byCategory, last, swaps, swapStats, gunStats, cursorRows] = await env.DB.batch([
 		env.DB.prepare(
 			`SELECT category, COUNT(*) AS fights, COALESCE(SUM(outcome = 'KILL'), 0) AS kills, COALESCE(SUM(outcome = 'DEATH'), 0) AS deaths
 			   FROM fights WHERE uuid = ? GROUP BY category`,
@@ -1227,6 +1263,11 @@ async function adminPlayerInfo(request: Request, env: Env): Promise<Response> {
 		).bind(player.uuid),
 		env.DB.prepare(
 			`SELECT gun, SUM(shots) AS shots, SUM(hits) AS hits, SUM(headshots) AS headshots FROM fight_guns WHERE uuid = ? GROUP BY gun`,
+		).bind(player.uuid),
+		// For the cursor flags: how each successful swap's cursor travelled (at most a few hundred rows).
+		env.DB.prepare(
+			`SELECT category, needed_deg, approach_deg, reach_ms FROM swaps
+			  WHERE uuid = ? AND result = 'SUCCESS' AND category IN ('WING', 'AIR') AND needed_deg IS NOT NULL`,
 		).bind(player.uuid),
 	]);
 	const categories = (byCategory.results ?? []) as { category: string | null; fights: number; kills: number; deaths: number }[];
@@ -1254,7 +1295,7 @@ async function adminPlayerInfo(request: Request, env: Env): Promise<Response> {
 		fights_by_category: fightsByCategory,
 		last_fight_at: ((last.results?.[0] as { last_fight_at: number | null } | undefined)?.last_fight_at) ?? null,
 		swaps: ((swaps.results?.[0] as { swaps: number } | undefined)?.swaps) ?? 0,
-		flags: playerFlags(swapStats.results as SwapFlagRow[], gunStats.results as GunFlagRow[], fights, kills, deaths),
+		flags: [...playerFlags(swapStats.results as SwapFlagRow[], gunStats.results as GunFlagRow[], fights, kills, deaths), ...cursorFlags(cursorRows.results as CursorRow[])],
 	});
 }
 
