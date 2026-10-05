@@ -121,7 +121,8 @@ async function route(request: Request, env: Env): Promise<Response> {
 
 	if (method === "GET" && pathname === "/leaderboard") return leaderboard(request, env);
 
-	// Admin mode: deleting stats data. Both check ADMIN_UUIDS on every request.
+	// Admin mode: looking a player up, and deleting stats data. All check ADMIN_UUIDS on every request.
+	if (method === "GET" && pathname === "/admin/player-info") return adminPlayerInfo(request, env);
 	const adminPlayer = pathname.match(/^\/admin\/players\/([0-9a-f]{32})$/);
 	if (method === "DELETE" && adminPlayer) return adminDeletePlayerData(request, env, adminPlayer[1]);
 	const adminFight = pathname.match(/^\/admin\/players\/([0-9a-f]{32})\/fights\/([0-9a-f]{32})$/);
@@ -202,6 +203,8 @@ async function login(request: Request, env: Env): Promise<Response> {
 		env.DB.prepare("INSERT INTO sessions (token_hash, uuid, expires) VALUES (?, ?, ?)")
 			.bind(await sha256Hex(token), uuid, now + SESSION_TTL_MS),
 	]);
+	// After the player row exists (a first login inserts it just above).
+	await modVersionStatement(env, request, uuid)?.run();
 
 	return json({ token, uuid, name: profile.name });
 }
@@ -277,12 +280,29 @@ const PRESENCE_WINDOW_MS = 40 * 60_000;
 /** A heartbeat within this long of the last one is ignored, so nobody can turn it into a write flood. */
 const PRESENCE_MIN_GAP_MS = 60_000;
 
+/** The mod sends its version with every request; only a plausible-looking one is kept. */
+function modVersionOf(request: Request): string | null {
+	const version = request.headers.get("X-GTMAddOns-Version");
+	return version !== null && /^[0-9][0-9A-Za-z.+-]{0,23}$/.test(version) ? version : null;
+}
+
+/** Records the player's mod version on their row - only when it changed, so it costs no write otherwise. Null if no usable header. */
+function modVersionStatement(env: Env, request: Request, uuid: string): D1PreparedStatement | null {
+	const version = modVersionOf(request);
+	if (version === null) return null;
+	return env.DB.prepare("UPDATE players SET mod_version = ? WHERE uuid = ? AND (mod_version IS NULL OR mod_version != ?)").bind(version, uuid, version);
+}
+
 /** The mod tells us it is running (about every 15 minutes while the game is open). */
 async function presence(request: Request, env: Env): Promise<Response> {
 	const uuid = await authenticate(request, env);
 	if (!uuid) return json({ error: "not logged in" }, 401);
 	const now = Date.now();
-	await env.DB.prepare("UPDATE players SET last_seen = ? WHERE uuid = ? AND last_seen < ?").bind(now, uuid, now - PRESENCE_MIN_GAP_MS).run();
+	const version = modVersionStatement(env, request, uuid);
+	await env.DB.batch([
+		env.DB.prepare("UPDATE players SET last_seen = ? WHERE uuid = ? AND last_seen < ?").bind(now, uuid, now - PRESENCE_MIN_GAP_MS),
+		...(version ? [version] : []),
+	]);
 	return json({ ok: true });
 }
 
@@ -449,6 +469,8 @@ async function uploadFight(request: Request, env: Env): Promise<Response> {
 	statements.push(env.DB.prepare(`DELETE FROM fights WHERE id IN (${old})`).bind(uuid, category));
 	statements.push(env.DB.prepare("UPDATE players SET last_seen = ? WHERE uuid = ?").bind(now, uuid));
 	if (category) statements.push(dirtyStatement(env, uuid, category));
+	const version = modVersionStatement(env, request, uuid);
+	if (version) statements.push(version);
 	await env.DB.batch(statements);
 
 	return json({ stored: 1 });
@@ -1110,6 +1132,66 @@ async function requireAdmin(request: Request, env: Env): Promise<{ admin: string
 	if (!uuid) return { denied: json({ error: "not logged in" }, 401) };
 	if (!isAdmin(env, uuid)) return { denied: json({ error: "admin access only" }, 403) };
 	return { admin: uuid };
+}
+
+/**
+ * Admin mode: what the backend knows about one player, by name (ignoring case) or by uuid:
+ *   GET /admin/player-info?name=Steve     GET /admin/player-info?uuid=<32 hex>
+ * Several players with the same name (a changed name): the one seen most recently.
+ */
+async function adminPlayerInfo(request: Request, env: Env): Promise<Response> {
+	const auth = await requireAdmin(request, env);
+	if ("denied" in auth) return auth.denied;
+
+	const params = new URL(request.url).searchParams;
+	const uuidParam = normalizeUuid(params.get("uuid") ?? "");
+	const name = (params.get("name") ?? "").trim();
+	let player: { uuid: string; name: string; first_seen: number; last_seen: number; mod_version: string | null } | null = null;
+	if (/^[0-9a-f]{32}$/.test(uuidParam)) {
+		player = await env.DB.prepare("SELECT uuid, name, first_seen, last_seen, mod_version FROM players WHERE uuid = ?").bind(uuidParam).first();
+	} else if (/^[A-Za-z0-9_]{1,16}$/.test(name)) {
+		player = await env.DB.prepare(
+			"SELECT uuid, name, first_seen, last_seen, mod_version FROM players WHERE lower(name) = lower(?) ORDER BY last_seen DESC LIMIT 1",
+		).bind(name).first();
+	} else {
+		return json({ error: "give a player name (1-16 letters, digits, _) or a uuid" }, 400);
+	}
+	if (!player) return json({ error: "no such player" }, 404);
+
+	const [byCategory, last, swaps] = await env.DB.batch([
+		env.DB.prepare(
+			`SELECT category, COUNT(*) AS fights, COALESCE(SUM(outcome = 'KILL'), 0) AS kills, COALESCE(SUM(outcome = 'DEATH'), 0) AS deaths
+			   FROM fights WHERE uuid = ? GROUP BY category`,
+		).bind(player.uuid),
+		env.DB.prepare("SELECT MAX(ended_at) AS last_fight_at FROM fights WHERE uuid = ?").bind(player.uuid),
+		env.DB.prepare("SELECT COUNT(*) AS swaps FROM swaps WHERE uuid = ?").bind(player.uuid),
+	]);
+	const categories = (byCategory.results ?? []) as { category: string | null; fights: number; kills: number; deaths: number }[];
+	const fightsByCategory: Record<string, number> = {};
+	let fights = 0, kills = 0, deaths = 0;
+	for (const c of categories) {
+		fightsByCategory[c.category ?? "UNKNOWN"] = c.fights;
+		fights += c.fights;
+		kills += c.kills;
+		deaths += c.deaths;
+	}
+	console.log(JSON.stringify({ event: "admin_player_info", admin: auth.admin, target: player.uuid, name: player.name }));
+	return json({
+		uuid: player.uuid,
+		name: player.name,
+		first_seen: player.first_seen,
+		last_seen: player.last_seen,
+		mod_version: player.mod_version,
+		online: player.last_seen >= Date.now() - PRESENCE_WINDOW_MS,
+		dev: isDev(env, player.uuid),
+		admin: isAdmin(env, player.uuid),
+		fights,
+		kills,
+		deaths,
+		fights_by_category: fightsByCategory,
+		last_fight_at: ((last.results?.[0] as { last_fight_at: number | null } | undefined)?.last_fight_at) ?? null,
+		swaps: ((swaps.results?.[0] as { swaps: number } | undefined)?.swaps) ?? 0,
+	});
 }
 
 /**

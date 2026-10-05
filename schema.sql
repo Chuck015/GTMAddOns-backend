@@ -5,7 +5,8 @@ CREATE TABLE IF NOT EXISTS players (
 	uuid       TEXT PRIMARY KEY,  -- undashed, lowercase
 	name       TEXT NOT NULL,
 	first_seen INTEGER NOT NULL,  -- epoch ms
-	last_seen  INTEGER NOT NULL
+	last_seen  INTEGER NOT NULL,
+	mod_version TEXT              -- from the X-GTMAddOns-Version header (migration 0016)
 );
 
 -- One-time server IDs handed to the mod for the Mojang session check.
