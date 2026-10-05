@@ -1134,6 +1134,57 @@ async function requireAdmin(request: Request, env: Env): Promise<{ admin: string
 	return { admin: uuid };
 }
 
+// ---- Flags: stats that are out of the norm (admin Player info) ----
+// Every rule has a minimum sample size, so a handful of lucky shots or swaps is never flagged. The limits come from the real
+// numbers of the players so far (2026-10-05): fastest Wing swap 105 ms, average 158 ms at best; mouse path efficiency 71-84%;
+// speed before a Wing swap tops out around 32 b/s; hit rate at most 19% with 100+ shots; headshots 11-30% of hits.
+const FLAG_FAST_SWAP_MS = 100;
+const FLAG_HIGH_SPEED_BPS = 40;
+
+interface SwapFlagRow {
+	category: string; n: number; fastest: number; under_fast: number; avg_ms: number; avg_efficiency: number | null; n_efficiency: number;
+	fast_start: number; n_speed: number; sum_before: number | null; sum_after: number | null;
+}
+interface GunFlagRow { gun: string; shots: number; hits: number; headshots: number }
+interface Flag { level: "warn" | "note"; text: string }
+
+export function playerFlags(swaps: SwapFlagRow[], guns: GunFlagRow[], fights: number, kills: number, deaths: number): Flag[] {
+	const flags: Flag[] = [];
+	for (const s of swaps) {
+		const label = s.category === "WING" ? "Wing" : "Air";
+		if (s.n >= 10 && s.under_fast >= 2) {
+			flags.push({ level: "warn", text: `${label} swaps under ${FLAG_FAST_SWAP_MS} ms: ${s.under_fast} of ${s.n} (fastest ${Math.round(s.fastest)} ms)` });
+		}
+		if (s.n >= 20 && s.avg_ms < 120) {
+			flags.push({ level: "warn", text: `${label} swaps average ${Math.round(s.avg_ms)} ms over ${s.n} swaps (the quickest others get is about 160)` });
+		}
+		if (s.n_efficiency >= 20 && s.avg_efficiency !== null && s.avg_efficiency >= 92) {
+			flags.push({ level: "warn", text: `${label} mouse path efficiency averages ${Math.round(s.avg_efficiency)}% over ${s.n_efficiency} swaps (usually 70-85%)` });
+		}
+		if (s.fast_start >= 2) {
+			flags.push({ level: "warn", text: `${s.fast_start} ${label} swaps started above ${FLAG_HIGH_SPEED_BPS} b/s (others top out around 32)` });
+		}
+		if (s.n_speed >= 8 && s.sum_before && s.sum_after !== null && s.sum_after / s.sum_before > 1.05) {
+			flags.push({ level: "warn", text: `${label} speed kept averages ${Math.round((100 * s.sum_after) / s.sum_before)}% over ${s.n_speed} swaps (it cannot exceed 100%)` });
+		}
+	}
+	for (const g of guns) {
+		if (/net launcher/i.test(g.gun)) continue;
+		if (g.shots >= 150 && g.hits / g.shots >= 0.5) {
+			flags.push({ level: "warn", text: `${g.gun}: ${Math.round((100 * g.hits) / g.shots)}% hit rate over ${g.shots} shots (others reach about 20%)` });
+		}
+		if (g.hits >= 80 && g.headshots / g.hits >= 0.45) {
+			flags.push({ level: "warn", text: `${g.gun}: headshots are ${Math.round((100 * g.headshots) / g.hits)}% of ${g.hits} hits (usually 10-30%)` });
+		}
+	}
+	if (fights >= 30 && deaths > 0 && kills / deaths >= 6) {
+		flags.push({ level: "note", text: `K/D ${(kills / deaths).toFixed(1)} over ${fights} fights (very high)` });
+	} else if (fights >= 30 && deaths === 0 && kills >= 20) {
+		flags.push({ level: "note", text: `${kills} kills and no deaths over ${fights} fights` });
+	}
+	return flags;
+}
+
 /**
  * Admin mode: what the backend knows about one player, by name (ignoring case) or by uuid:
  *   GET /admin/player-info?name=Steve     GET /admin/player-info?uuid=<32 hex>
@@ -1158,13 +1209,25 @@ async function adminPlayerInfo(request: Request, env: Env): Promise<Response> {
 	}
 	if (!player) return json({ error: "no such player" }, 404);
 
-	const [byCategory, last, swaps] = await env.DB.batch([
+	const [byCategory, last, swaps, swapStats, gunStats] = await env.DB.batch([
 		env.DB.prepare(
 			`SELECT category, COUNT(*) AS fights, COALESCE(SUM(outcome = 'KILL'), 0) AS kills, COALESCE(SUM(outcome = 'DEATH'), 0) AS deaths
 			   FROM fights WHERE uuid = ? GROUP BY category`,
 		).bind(player.uuid),
 		env.DB.prepare("SELECT MAX(ended_at) AS last_fight_at FROM fights WHERE uuid = ?").bind(player.uuid),
 		env.DB.prepare("SELECT COUNT(*) AS swaps FROM swaps WHERE uuid = ?").bind(player.uuid),
+		// For the flags: successful Wing and Air swaps, and gun totals.
+		env.DB.prepare(
+			`SELECT category, COUNT(*) AS n, MIN(total_ms) AS fastest, COALESCE(SUM(total_ms < ${FLAG_FAST_SWAP_MS}), 0) AS under_fast, AVG(total_ms) AS avg_ms,
+			        AVG(efficiency) AS avg_efficiency, COUNT(efficiency) AS n_efficiency,
+			        COALESCE(SUM(speed_before_bps > ${FLAG_HIGH_SPEED_BPS}), 0) AS fast_start,
+			        COALESCE(SUM(speed_before_bps IS NOT NULL AND speed_after_bps IS NOT NULL), 0) AS n_speed,
+			        SUM(CASE WHEN speed_after_bps IS NOT NULL THEN speed_before_bps END) AS sum_before, SUM(speed_after_bps) AS sum_after
+			   FROM swaps WHERE uuid = ? AND result = 'SUCCESS' AND category IN ('WING', 'AIR') GROUP BY category`,
+		).bind(player.uuid),
+		env.DB.prepare(
+			`SELECT gun, SUM(shots) AS shots, SUM(hits) AS hits, SUM(headshots) AS headshots FROM fight_guns WHERE uuid = ? GROUP BY gun`,
+		).bind(player.uuid),
 	]);
 	const categories = (byCategory.results ?? []) as { category: string | null; fights: number; kills: number; deaths: number }[];
 	const fightsByCategory: Record<string, number> = {};
@@ -1191,6 +1254,7 @@ async function adminPlayerInfo(request: Request, env: Env): Promise<Response> {
 		fights_by_category: fightsByCategory,
 		last_fight_at: ((last.results?.[0] as { last_fight_at: number | null } | undefined)?.last_fight_at) ?? null,
 		swaps: ((swaps.results?.[0] as { swaps: number } | undefined)?.swaps) ?? 0,
+		flags: playerFlags(swapStats.results as SwapFlagRow[], gunStats.results as GunFlagRow[], fights, kills, deaths),
 	});
 }
 
