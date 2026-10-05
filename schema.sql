@@ -114,3 +114,23 @@ CREATE INDEX IF NOT EXISTS players_last_seen ON players (last_seen);
 -- Every login deletes expired sessions and challenges; these keep that cheap (migration 0014).
 CREATE INDEX IF NOT EXISTS sessions_expires ON sessions (expires);
 CREATE INDEX IF NOT EXISTS challenges_expires ON challenges (expires);
+
+-- Leaderboard rows per player (migration 0015): each player's entry per category and view size (25 / 50 / 100 fights),
+-- rebuilt only when that player's fights in that category changed (leaderboard_dirty).
+CREATE TABLE IF NOT EXISTS leaderboard_rows (
+  uuid     TEXT    NOT NULL,
+  category TEXT    NOT NULL,
+  n        INTEGER NOT NULL,
+  row      TEXT    NOT NULL,
+  built_at INTEGER NOT NULL,
+  PRIMARY KEY (uuid, category, n)
+);
+
+CREATE INDEX IF NOT EXISTS leaderboard_rows_view ON leaderboard_rows (category, n);
+
+CREATE TABLE IF NOT EXISTS leaderboard_dirty (
+  uuid      TEXT    NOT NULL,
+  category  TEXT    NOT NULL,
+  marked_at INTEGER NOT NULL,
+  PRIMARY KEY (uuid, category)
+);
