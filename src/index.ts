@@ -820,8 +820,7 @@ export async function computeLeaderboard(env: Env, category: string, n: number, 
 			  WHERE g.category = 'GROUND' AND g.speed_shots > 0 GROUP BY g.uuid, g.gun`,
 		));
 	}
-	{
-		// Every category: melee counts inside Aim for Wing, Air and Ground, and is the JP melee rating.
+	if (category === "JP" || category === "AIR") {
 		labels.push("combos");
 		statements.push(env.DB.prepare(
 			`${picked} SELECT c.uuid, c.category, SUM(c.enemy_combos) AS enemy_combos, SUM(c.enemy_broken) AS enemy_broken,
