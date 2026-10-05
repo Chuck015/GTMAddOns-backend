@@ -1153,8 +1153,10 @@ interface CursorRow { category: string; needed_deg: number; approach_deg: number
  * Cursor tricks (see the comment above FLAG_FAST_SWAP_MS for the sample-size idea). In vanilla the cursor starts at the centre of the
  * screen each time the inventory opens, so the distance it must travel to the chest slot (needed_deg) is nearly the same on every swap
  * of a player (it differs between players with window size, GUI scale and sensitivity: 1.7-8.2 degrees so far). So:
- *  - swaps that needed much less travel than this player's usual (under 30% of their median) mean the cursor did not start in the
- *    centre but on or near the slot (a bug, a mod that keeps the cursor, a macro...);
+ *  - swaps that needed much less travel than this player's usual (under 20% of their median) mean the cursor did not start in the
+ *    centre but on or near the slot (a bug, a mod that keeps the cursor, a macro...). The recipe book is legal and moves the start
+ *    to about 60% of the closed-book distance (the inventory slides right, the cursor still starts at the screen centre), so it is
+ *    well clear of this line; the data shows it too: players sit in groups about 0.55-0.6 apart;
  *  - reaching the slot in under 25 ms (the quickest real one is 40 ms);
  *  - a path to the slot shorter than half the straight line is not possible with a real mouse.
  * Changing window size or GUI scale between swaps can also move the typical value, hence "check".
@@ -1167,7 +1169,7 @@ export function cursorFlags(rows: CursorRow[]): Flag[] {
 		if (mine.length < 15) continue;
 		const needed = mine.map((r) => r.needed_deg).sort((a, b) => a - b);
 		const median = needed[Math.floor(needed.length / 2)];
-		const close = mine.filter((r) => r.needed_deg < 0.3 * median);
+		const close = mine.filter((r) => r.needed_deg < 0.2 * median);
 		if (close.length >= 3 && close.length / mine.length >= 0.05) {
 			const least = Math.min(...close.map((r) => r.needed_deg));
 			flags.push({ level: "warn", text: `${label}: the cursor started near the chest slot on ${close.length} of ${mine.length} swaps (needed ${least.toFixed(1)}\u00B0 vs usually ${median.toFixed(1)}\u00B0; check window size changes)` });
