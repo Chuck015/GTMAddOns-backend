@@ -91,6 +91,11 @@ const METRICS = [
 // How the inventory opened (see migration 0017). Stored with every swap but not part of METRICS, so the stats views don't read them.
 const INPUT_METRICS = ["cursor_dx", "cursor_dy", "direct_px", "approach_px", "gui_x", "gui_y", "scaled_w", "scaled_h", "gui_scale", "creative", "from_screen"] as const;
 
+// WASD over the window after a Wing / Air swap into an empty hotbar slot (migration 0019). Insert only, like INPUT_METRICS.
+const AFTER_METRICS = ["after_w_ms", "after_a_ms", "after_s_ms", "after_d_ms", "after_window_ms", "after_strafe_switches"] as const;
+// Keys of the fight's movement_input object that are kept (all numbers); anything else the mod sends is dropped.
+const MOVEMENT_KEYS = ["ms", "w_ms", "a_ms", "s_ms", "d_ms", "still_ms", "ground_ms", "sprint_ms", "sneak_ms", "strafe_switches", "fb_switches", "jumps", "distance", "max_bps"] as const;
+
 export default {
 	async fetch(request, env): Promise<Response> {
 		try {
@@ -111,6 +116,7 @@ async function route(request: Request, env: Env): Promise<Response> {
 	if (method === "GET" && pathname === "/me") return me(request, env);
 	if (method === "POST" && pathname === "/presence") return presence(request, env);
 	if (method === "GET" && pathname === "/users") return modUsers(request, env);
+	if (method === "POST" && pathname === "/users/check") return checkModUsers(request, env);
 	if (method === "POST" && pathname === "/fights") return uploadFight(request, env);
 	if (method === "POST" && (pathname === "/swaps" || pathname === "/guns" || pathname === "/combos")) {
 		return ignoreLegacyUpload(request, env);
@@ -121,11 +127,15 @@ async function route(request: Request, env: Env): Promise<Response> {
 
 	const playerFightList = pathname.match(/^\/players\/([0-9a-f]{32})\/fights$/);
 	if (method === "GET" && playerFightList) return playerFights(request, env, playerFightList[1]);
+	const playerRawList = pathname.match(/^\/players\/([0-9a-f]{32})\/raw$/);
+	if (method === "GET" && playerRawList) return playerRaw(request, env, playerRawList[1]);
 
 	if (method === "GET" && pathname === "/leaderboard") return leaderboard(request, env);
 
 	// Admin mode: looking a player up, and deleting stats data. All check ADMIN_UUIDS on every request.
 	if (method === "GET" && pathname === "/admin/player-info") return adminPlayerInfo(request, env);
+	if (method === "GET" && pathname === "/admin/flag-rules") return adminFlagRules(request, env);
+	if (method === "GET" && pathname === "/admin/flagged") return adminFlagged(request, env);
 	const adminPlayer = pathname.match(/^\/admin\/players\/([0-9a-f]{32})$/);
 	if (method === "DELETE" && adminPlayer) return adminDeletePlayerData(request, env, adminPlayer[1]);
 	const adminFight = pathname.match(/^\/admin\/players\/([0-9a-f]{32})\/fights\/([0-9a-f]{32})$/);
@@ -310,6 +320,36 @@ async function presence(request: Request, env: Env): Promise<Response> {
 }
 
 /**
+ * How recently the backend must have heard from a player (login, upload or heartbeat) for a check to say they run the mod. Long on
+ * purpose: the mod only asks about players who are on the server right now, so a long-AFK player still counts, and the only false
+ * positive is someone who switched to a client without the mod within these hours.
+ */
+const CHECK_WINDOW_MS = 6 * 60 * 60_000;
+const CHECK_MAX_UUIDS = 90;
+
+/**
+ * The mod asks once about each player in its tab list: body { uuids: [undashed, ...] } (at most 90), answer { uuids: [the ones
+ * running the mod] }. One indexed lookup per uuid, nothing stored.
+ */
+async function checkModUsers(request: Request, env: Env): Promise<Response> {
+	if (!(await authenticate(request, env))) return json({ error: "not logged in" }, 401);
+	let body: unknown;
+	try {
+		body = await request.json();
+	} catch {
+		return json({ error: "bad json" }, 400);
+	}
+	const raw = (body as { uuids?: unknown } | null)?.uuids;
+	if (!Array.isArray(raw)) return json({ error: "uuids must be a list" }, 400);
+	const uuids = [...new Set(raw.filter((u): u is string => typeof u === "string" && /^[0-9a-f]{32}$/.test(u)))].slice(0, CHECK_MAX_UUIDS);
+	if (uuids.length === 0) return json({ uuids: [] });
+	const { results } = await env.DB.prepare(
+		`SELECT uuid FROM players WHERE last_seen >= ? AND uuid IN (${uuids.map(() => "?").join(", ")})`,
+	).bind(Date.now() - CHECK_WINDOW_MS, ...uuids).all<{ uuid: string }>();
+	return json({ uuids: results.map((r) => r.uuid) });
+}
+
+/**
  * The UUIDs (undashed) of players running the mod right now, for the icon next to their name. Built from
  * players.last_seen (indexed, migration 0013) and stored for five minutes like a leaderboard view, so asking
  * costs one row read.
@@ -381,15 +421,30 @@ async function uploadFight(request: Request, env: Env): Promise<Response> {
 		? body.category
 		: guessCategory(swaps, guns);
 
+	// What the opponent looked like (the mod's GearTracker): a PvP category and a short JSON text of their gear.
+	const opponentCategory = typeof body?.opponent_category === "string" && CATEGORIES.has(body.opponent_category) ? body.opponent_category : null;
+	const opponentGear = typeof body?.opponent_gear === "string" && body.opponent_gear.length > 0 && body.opponent_gear.length <= 1600 ? body.opponent_gear : null;
+
+	// The movement keys during the fight, kept as JSON text of the known numbers only.
+	let movementInput: string | null = null;
+	if (body?.movement_input && typeof body.movement_input === "object") {
+		const kept: Record<string, number> = {};
+		for (const key of MOVEMENT_KEYS) {
+			const v = finiteOrNull((body.movement_input as Record<string, unknown>)[key]);
+			if (v !== null) kept[key] = Math.round(v * 100) / 100;
+		}
+		if (Object.keys(kept).length > 0) movementInput = JSON.stringify(kept);
+	}
+
 	// Children find their fight by (uuid, fight_key), so everything can go in one batch.
 	const fightId = "(SELECT id FROM fights WHERE uuid = ? AND fight_key = ?)";
 	const statements: D1PreparedStatement[] = [
 		env.DB.prepare(
-			"INSERT INTO fights (uuid, fight_key, started_at, ended_at, outcome, opponent, category) VALUES (?, ?, ?, ?, ?, ?, ?)",
-		).bind(uuid, fightKey, startedAt, endedAt, outcome, opponent, category),
+			"INSERT INTO fights (uuid, fight_key, started_at, ended_at, outcome, opponent, category, opponent_category, opponent_gear, movement_input) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+		).bind(uuid, fightKey, startedAt, endedAt, outcome, opponent, category, opponentCategory, opponentGear, movementInput),
 	];
 
-	const swapColumns = ["uuid", "ts", "result", "category", "swap_type", "total_ms", ...METRICS, ...INPUT_METRICS];
+	const swapColumns = ["uuid", "ts", "result", "category", "swap_type", "total_ms", ...METRICS, ...INPUT_METRICS, ...AFTER_METRICS];
 	const insertSwap = env.DB.prepare(
 		`INSERT INTO swaps (fight_id, ${swapColumns.join(", ")}) VALUES (${fightId}, ${swapColumns.map(() => "?").join(", ")})`,
 	);
@@ -404,7 +459,7 @@ async function uploadFight(request: Request, env: Env): Promise<Response> {
 		}
 		const ts = clampTs(finiteOrNull(s.ts) ?? now, now);
 		statements.push(insertSwap.bind(uuid, fightKey, uuid, ts, s.result, s.category, swapType, totalMs,
-			...METRICS.map((m) => finiteOrNull(s[m])), ...INPUT_METRICS.map((m) => finiteOrNull(s[m]))));
+			...METRICS.map((m) => finiteOrNull(s[m])), ...INPUT_METRICS.map((m) => finiteOrNull(s[m])), ...AFTER_METRICS.map((m) => finiteOrNull(s[m]))));
 	}
 
 	const insertGun = env.DB.prepare(
@@ -555,7 +610,7 @@ async function playerDetail(request: Request, env: Env, uuid: string): Promise<R
 	const inView = `fight_id IN (${lastFights(n, category)})`;
 
 	const averages = ["total_ms", ...METRICS].map((m) => `AVG(${m}) AS ${m}`).join(", ");
-	const [fights, counts, avg, recent, guns, airSwaps, combos, recentFights, movementGuns] = await env.DB.batch([
+	const [fights, counts, avg, recent, guns, airSwaps, combos, recentFights, movementGuns, airAvg] = await env.DB.batch([
 		env.DB.prepare(
 			`SELECT COUNT(*)                              AS fights,
 			        COALESCE(SUM(outcome = 'KILL'), 0)    AS kills,
@@ -621,6 +676,8 @@ async function playerDetail(request: Request, env: Env, uuid: string): Promise<R
 			   FROM fight_guns WHERE category = 'GROUND' AND speed_shots > 0 AND ${inView}
 			  GROUP BY gun ORDER BY shots DESC`,
 		).bind(uuid),
+		// Air PvP swaps: the same averages as Wing's (mouse movement and steps), over all successful Air swaps.
+		env.DB.prepare(`SELECT ${averages} FROM swaps WHERE category = 'AIR' AND result = 'SUCCESS' AND ${inView}`).bind(uuid),
 	]);
 
 	return json({
@@ -634,7 +691,64 @@ async function playerDetail(request: Request, env: Env, uuid: string): Promise<R
 		combos: combos.results,
 		recent_fights: recentFights.results,
 		movement_guns: movementGuns.results,
+		air_avg: airAvg.results[0],
 	});
+}
+
+/** How long a player's raw data is kept before it is read again, and the most swap rows it holds. */
+const RAW_TTL_S = 900;
+const RAW_MAX_SWAPS = 4000;
+/** Columns that are the same on every row or only link rows together, so they are not sent. */
+const RAW_SKIP = new Set(["id", "uuid", "fight_id"]);
+
+/**
+ * Everything the backend stores about one player, as it is stored: the player row and, for the fights it keeps (the last MAX_FIGHTS of
+ * each category), the fights, their swaps, gun totals and combo totals (SELECT *, so a column added later is included automatically).
+ * Open to every logged-in player - it is the same data the stats screens are built from, and what the admin flags are computed from.
+ * Sent column-wise to keep it small: { player, fights: { cols, rows }, swaps: { cols, rows, fight }, ... } where each row is an array of
+ * values in cols order (null = not recorded), numbers rounded to 2 decimals, and "fight" gives each child row its fight's row number.
+ * Kept in leaderboard_views for RAW_TTL_S, so opening it again costs one row; cut to RAW_MAX_SWAPS swaps (newest first).
+ */
+async function playerRaw(request: Request, env: Env, uuid: string): Promise<Response> {
+	if (!(await authenticate(request, env))) return json({ error: "not logged in" }, 401);
+	const headers = { "Content-Type": "application/json" };
+	const key = `raw-${uuid}`;
+	const stored = await readStoredView(env, key, RAW_TTL_S);
+	if (stored) return new Response(stored, { headers });
+
+	const player = await env.DB.prepare("SELECT uuid, name, first_seen, last_seen, mod_version FROM players WHERE uuid = ?").bind(uuid).first();
+	if (!player) return json({ error: "no such player" }, 404);
+	const kept = `SELECT id FROM (SELECT id, ROW_NUMBER() OVER (PARTITION BY category ORDER BY ended_at DESC, id DESC) AS rn
+		FROM fights WHERE uuid = ?) WHERE rn <= ${MAX_FIGHTS}`;
+	const [fights, swaps, guns, combos] = await env.DB.batch([
+		env.DB.prepare(`SELECT * FROM fights WHERE id IN (${kept}) ORDER BY ended_at DESC, id DESC`).bind(uuid),
+		env.DB.prepare(`SELECT * FROM swaps WHERE fight_id IN (${kept}) ORDER BY ts DESC LIMIT ${RAW_MAX_SWAPS}`).bind(uuid),
+		env.DB.prepare(`SELECT * FROM fight_guns WHERE fight_id IN (${kept})`).bind(uuid),
+		env.DB.prepare(`SELECT * FROM fight_combos WHERE fight_id IN (${kept})`).bind(uuid),
+	]);
+
+	const fightRows = fights.results as Record<string, unknown>[];
+	const rowOfFight = new Map<number, number>();
+	fightRows.forEach((f, i) => rowOfFight.set(f.id as number, i));
+	const round = (v: unknown) => (typeof v === "number" && !Number.isInteger(v) ? Math.round(v * 100) / 100 : v);
+	const table = (rows: Record<string, unknown>[], children: boolean) => {
+		const cols = rows.length > 0 ? Object.keys(rows[0]).filter((c) => !RAW_SKIP.has(c)) : [];
+		return {
+			cols,
+			rows: rows.map((r) => cols.map((c) => round(r[c]) ?? null)),
+			...(children ? { fight: rows.map((r) => rowOfFight.get(r.fight_id as number) ?? -1) } : {}),
+		};
+	};
+	const body = JSON.stringify({
+		player,
+		fights: table(fightRows, false),
+		swaps: table(swaps.results as Record<string, unknown>[], true),
+		guns: table(guns.results as Record<string, unknown>[], true),
+		combos: table(combos.results as Record<string, unknown>[], true),
+	});
+	// A row in leaderboard_views must stay well under D1's row size limit.
+	if (body.length < 900_000) await storeView(env, key, body);
+	return new Response(body, { headers });
 }
 
 /** Most swap rows sent with one player's fight list (newest first), so a huge history can't make an enormous reply. */
@@ -1103,10 +1217,10 @@ export async function computeLeaderboardFromRows(env: Env, category: string, n: 
 	});
 }
 
-export async function readStoredView(env: Env, key: string): Promise<string | null> {
+export async function readStoredView(env: Env, key: string, ttlSeconds = LEADERBOARD_TTL_S): Promise<string | null> {
 	try {
 		const row = await env.DB.prepare("SELECT body FROM leaderboard_views WHERE key = ? AND computed_at > ?")
-			.bind(key, Date.now() - LEADERBOARD_TTL_S * 1000)
+			.bind(key, Date.now() - ttlSeconds * 1000)
 			.first<{ body: string }>();
 		return row?.body ?? null;
 	} catch {
@@ -1150,6 +1264,103 @@ interface SwapFlagRow {
 }
 interface GunFlagRow { gun: string; shots: number; hits: number; headshots: number }
 interface Flag { level: "warn" | "note"; text: string }
+/** What each flag needs before it shows, in words (admin Player info > Flag rules). Keep in step with playerFlags / cursorFlags / inputFlags. */
+export function flagRules(): { title: string; requirement: string }[] {
+	return [
+		{ title: "Fast swaps (Wing, Air)", requirement: `Any single successful swap of that kind under ${FLAG_FAST_SWAP_MS} ms (no minimum number of swaps).` },
+		{ title: "Fast average swap", requirement: "At least 20 successful swaps of that kind and an average swap time under 120 ms." },
+		{ title: "Mouse path efficiency", requirement: "At least 20 swaps with an efficiency reading and an average of 92% or more (normal is 70-85%)." },
+		{ title: "Fast start speed", requirement: `2 or more swaps that started above ${FLAG_HIGH_SPEED_BPS} blocks/s (others top out around 32).` },
+		{ title: "Speed kept", requirement: "At least 8 swaps with a speed before and after, and the speed after adds up to more than 105% of the speed before (it cannot exceed 100%)." },
+		{ title: "Gun hit rate", requirement: "At least 150 shots with one gun (the Net Launcher is skipped) and a hit rate of 50% or more." },
+		{ title: "Gun headshots", requirement: "At least 80 hits with one gun and headshots making up 45% or more of them." },
+		{ title: "K/D (a note, not a warning)", requirement: "At least 30 fights and a K/D of 6 or more; or 20 or more kills with no deaths over 30+ fights." },
+		{ title: "Cursor started near the chest slot", requirement: "At least 15 successful Wing / Air swaps of that kind with a distance reading; on 3 or more of them and 5% or more, the cursor needed under 20% of the player's usual travel distance (the median)." },
+		{ title: "Cursor reached the slot instantly", requirement: "The same 15 swaps minimum; 3 or more reached the slot in under 25 ms (the quickest real one is 40 ms)." },
+		{ title: "Cursor path shorter than possible", requirement: "The same 15 swaps minimum; on 3 or more and 5% or more, the cursor path was under half the straight line (swaps needing at least 1 degree of travel)." },
+		{ title: "Cursor not at the window centre", requirement: "Input checks use a player's latest 300 swaps: only survival-inventory swaps opened from gameplay count, and at least 10 of them. Flags when the cursor was more than 3 px off the window centre on 3 or more swaps and 5% or more." },
+		{ title: "Inventory not where vanilla draws it", requirement: "The same 10 swaps minimum. The inventory must be vertically centred and horizontally either centred (recipe book closed) or shifted by the open recipe book, within 3 scaled px; 3 or more swaps and 5% or more outside that are flagged (a mod that moves the inventory)." },
+		{ title: "Cursor started on the chest slot", requirement: "The same 10 swaps minimum; 3 or more and 5% or more with the cursor within 12 scaled px of the slot when the inventory opened (the recipe book never does this)." },
+		{ title: "Cursor path under half (pixels)", requirement: "The same 10 swaps minimum; 3 or more and 5% or more where the slot was at least 40 px away and the travelled path was under half the straight line." },
+		{ title: "Recipe book / GUI scale (a note)", requirement: "Shown whenever the 10 input swaps exist: how often the recipe book was open and which GUI scales the player uses." },
+	];
+}
+
+/** How long the list of flagged players is kept before it is worked out again (it reads about 30 000 rows). */
+const FLAGGED_TTL_S = 900;
+
+/**
+ * Admin mode: every player who has at least one warning flag, with all of their flags (the same rules as Player info), the most
+ * warnings first. Worked out from whole-table queries - five of them in one batch, about 30 000 rows read - and kept in
+ * leaderboard_views for FLAGGED_TTL_S, so opening the list repeatedly costs one row.
+ */
+async function adminFlagged(request: Request, env: Env): Promise<Response> {
+	const auth = await requireAdmin(request, env);
+	if ("denied" in auth) return auth.denied;
+	const headers = { "Content-Type": "application/json" };
+	const stored = await readStoredView(env, "flagged-players", FLAGGED_TTL_S);
+	if (stored) return new Response(stored, { headers });
+
+	const [players, swapStats, gunStats, fightStats, cursorRows, inputRows] = await env.DB.batch([
+		env.DB.prepare("SELECT uuid, name FROM players"),
+		env.DB.prepare(
+			`SELECT uuid, category, COUNT(*) AS n, MIN(total_ms) AS fastest, COALESCE(SUM(total_ms < ${FLAG_FAST_SWAP_MS}), 0) AS under_fast, AVG(total_ms) AS avg_ms,
+			        AVG(efficiency) AS avg_efficiency, COUNT(efficiency) AS n_efficiency,
+			        COALESCE(SUM(speed_before_bps > ${FLAG_HIGH_SPEED_BPS}), 0) AS fast_start,
+			        COALESCE(SUM(speed_before_bps IS NOT NULL AND speed_after_bps IS NOT NULL), 0) AS n_speed,
+			        SUM(CASE WHEN speed_after_bps IS NOT NULL THEN speed_before_bps END) AS sum_before, SUM(speed_after_bps) AS sum_after
+			   FROM swaps WHERE result = 'SUCCESS' AND category IN ('WING', 'AIR') GROUP BY uuid, category`,
+		),
+		env.DB.prepare("SELECT uuid, gun, SUM(shots) AS shots, SUM(hits) AS hits, SUM(headshots) AS headshots FROM fight_guns GROUP BY uuid, gun"),
+		env.DB.prepare(
+			"SELECT uuid, COUNT(*) AS fights, COALESCE(SUM(outcome = 'KILL'), 0) AS kills, COALESCE(SUM(outcome = 'DEATH'), 0) AS deaths FROM fights GROUP BY uuid",
+		),
+		env.DB.prepare(
+			"SELECT uuid, category, needed_deg, approach_deg, reach_ms FROM swaps WHERE result = 'SUCCESS' AND category IN ('WING', 'AIR') AND needed_deg IS NOT NULL",
+		),
+		env.DB.prepare(`SELECT uuid, category, ${INPUT_METRICS.join(", ")} FROM swaps WHERE cursor_dx IS NOT NULL ORDER BY ts DESC`),
+	]);
+
+	const group = <T extends { uuid: string }>(rows: T[]): Map<string, T[]> => {
+		const map = new Map<string, T[]>();
+		for (const row of rows) {
+			const list = map.get(row.uuid);
+			if (list) list.push(row);
+			else map.set(row.uuid, [row]);
+		}
+		return map;
+	};
+	const swapsBy = group(swapStats.results as (SwapFlagRow & { uuid: string })[]);
+	const gunsBy = group(gunStats.results as (GunFlagRow & { uuid: string })[]);
+	const cursorBy = group(cursorRows.results as (CursorRow & { uuid: string })[]);
+	const inputBy = group(inputRows.results as (InputRow & { uuid: string })[]);
+	const fightsBy = new Map((fightStats.results as { uuid: string; fights: number; kills: number; deaths: number }[]).map((r) => [r.uuid, r]));
+
+	const flagged: { uuid: string; name: string; flags: Flag[] }[] = [];
+	for (const p of players.results as { uuid: string; name: string }[]) {
+		const f = fightsBy.get(p.uuid);
+		const flags = [
+			...playerFlags(swapsBy.get(p.uuid) ?? [], gunsBy.get(p.uuid) ?? [], f?.fights ?? 0, f?.kills ?? 0, f?.deaths ?? 0),
+			...cursorFlags(cursorBy.get(p.uuid) ?? []),
+			...inputFlags((inputBy.get(p.uuid) ?? []).slice(0, 300)),
+		];
+		if (flags.some((x) => x.level === "warn")) flagged.push({ uuid: p.uuid, name: p.name, flags });
+	}
+	const warnings = (p: { flags: Flag[] }) => p.flags.filter((x) => x.level === "warn").length;
+	flagged.sort((a, b) => warnings(b) - warnings(a) || a.name.localeCompare(b.name));
+	const body = JSON.stringify({ players: flagged, computed_at: Date.now() });
+	await storeView(env, "flagged-players", body);
+	console.log(JSON.stringify({ event: "admin_flagged", admin: auth.admin, flagged: flagged.length }));
+	return new Response(body, { headers });
+}
+
+/** Admin mode: the list above, for the Flag rules view. No database reads. */
+async function adminFlagRules(request: Request, env: Env): Promise<Response> {
+	const auth = await requireAdmin(request, env);
+	if ("denied" in auth) return auth.denied;
+	return json({ rules: flagRules() });
+}
+
 interface InputRow {
 	category: string; cursor_dx: number; cursor_dy: number; direct_px: number | null; approach_px: number | null;
 	gui_x: number; gui_y: number; scaled_w: number; scaled_h: number; gui_scale: number; creative: number; from_screen: number;
@@ -1241,7 +1452,7 @@ export function playerFlags(swaps: SwapFlagRow[], guns: GunFlagRow[], fights: nu
 	const flags: Flag[] = [];
 	for (const s of swaps) {
 		const label = s.category === "WING" ? "Wing" : "Air";
-		if (s.n >= 10 && s.under_fast >= 2) {
+		if (s.under_fast >= 1) {
 			flags.push({ level: "warn", text: `${label} swaps under ${FLAG_FAST_SWAP_MS} ms: ${s.under_fast} of ${s.n} (fastest ${Math.round(s.fastest)} ms)` });
 		}
 		if (s.n >= 20 && s.avg_ms < 120) {

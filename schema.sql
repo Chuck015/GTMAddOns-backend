@@ -33,6 +33,9 @@ CREATE TABLE IF NOT EXISTS fights (
 	outcome    TEXT NOT NULL,     -- KILL | DEATH
 	opponent   TEXT,              -- who you killed / who killed you, if the message said
 	category   TEXT,              -- GROUND | WING | JP | AIR when the fight started
+	opponent_category TEXT,       -- the same, for the opponent, from the gear seen on them (migration 0018)
+	opponent_gear     TEXT,       -- JSON text: their six slots at the start and end, and the chest items seen
+	movement_input    TEXT,       -- JSON text: movement keys during the fight (migration 0019)
 	UNIQUE (uuid, fight_key)
 );
 
@@ -74,7 +77,14 @@ CREATE TABLE IF NOT EXISTS swaps (
 	scaled_h           REAL,
 	gui_scale          REAL,
 	creative           REAL,
-	from_screen        REAL
+	from_screen        REAL,
+	-- WASD over the window after a swap into an empty hotbar slot (migration 0019)
+	after_w_ms            REAL,
+	after_a_ms            REAL,
+	after_s_ms            REAL,
+	after_d_ms            REAL,
+	after_window_ms       REAL,
+	after_strafe_switches REAL
 );
 
 CREATE INDEX IF NOT EXISTS swaps_uuid_ts ON swaps (uuid, ts);
