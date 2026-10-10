@@ -6,7 +6,8 @@ CREATE TABLE IF NOT EXISTS players (
 	name       TEXT NOT NULL,
 	first_seen INTEGER NOT NULL,  -- epoch ms
 	last_seen  INTEGER NOT NULL,
-	mod_version TEXT              -- from the X-GTMAddOns-Version header (migration 0016)
+	mod_version TEXT,             -- from the X-GTMAddOns-Version header (migration 0016)
+	data_epoch  INTEGER           -- bumped when an admin deletes any of the player's data (migration 0023)
 );
 
 -- One-time server IDs handed to the mod for the Mojang session check.
@@ -36,12 +37,18 @@ CREATE TABLE IF NOT EXISTS fights (
 	opponent_category TEXT,       -- the same, for the opponent, from the gear seen on them (migration 0018)
 	opponent_gear     TEXT,       -- JSON text: their six slots at the start and end, and the chest items seen
 	movement_input    TEXT,       -- JSON text: movement keys during the fight (migration 0019)
+	opponent_track    TEXT,       -- JSON text: the opponent's PvP type changes and swaps during the fight (migration 0020)
+	net_ended         INTEGER,    -- 1 when the mod cut the fight at a conceded Net Launcher net (migration 0022)
+	summary           TEXT,       -- JSON text: the fight's totals, read by every stats view (src/summary.ts, migration 0023)
 	UNIQUE (uuid, fight_key)
 );
 
 CREATE INDEX IF NOT EXISTS fights_uuid_ended ON fights (uuid, ended_at);
 CREATE INDEX IF NOT EXISTS fights_uuid_category_ended ON fights (uuid, category, ended_at);
 CREATE INDEX IF NOT EXISTS fights_category_uuid_ended ON fights (category, uuid, ended_at);
+-- Migration 0023: fights stored after a given one (?since=), and opponent-filtered leaderboards.
+CREATE INDEX IF NOT EXISTS fights_uuid_id ON fights (uuid, id);
+CREATE INDEX IF NOT EXISTS fights_category_opponent ON fights (category, lower(opponent));
 
 CREATE TABLE IF NOT EXISTS swaps (
 	id                 INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -102,6 +109,9 @@ CREATE TABLE IF NOT EXISTS fight_guns (
 	speed_shots     INTEGER,          -- movement guns only: shots with a speed recorded...
 	speed_total_bps REAL,             -- ...their summed horizontal blocks/s right after the shot...
 	speed_best_bps  REAL,             -- ...and the fastest
+	net_shots     INTEGER,         -- shots fired at a netted player (migration 0021)
+	net_hits      INTEGER,
+	net_headshots INTEGER,
 	PRIMARY KEY (fight_id, category, gun)
 );
 
@@ -138,7 +148,7 @@ CREATE INDEX IF NOT EXISTS players_last_seen ON players (last_seen);
 CREATE INDEX IF NOT EXISTS sessions_expires ON sessions (expires);
 CREATE INDEX IF NOT EXISTS challenges_expires ON challenges (expires);
 
--- Leaderboard rows per player (migration 0015): each player's entry per category and view size (25 / 50 / 100 fights),
+-- Leaderboard rows per player (migration 0015): each player's entry per category and view size (25 / 50 / 100 / 250 / 500 fights),
 -- rebuilt only when that player's fights in that category changed (leaderboard_dirty).
 CREATE TABLE IF NOT EXISTS leaderboard_rows (
   uuid     TEXT    NOT NULL,
@@ -156,4 +166,47 @@ CREATE TABLE IF NOT EXISTS leaderboard_dirty (
   category  TEXT    NOT NULL,
   marked_at INTEGER NOT NULL,
   PRIMARY KEY (uuid, category)
+);
+
+-- How many fights a player has per category, so an upload knows whether to prune without counting (migration 0023).
+CREATE TABLE IF NOT EXISTS fight_counts (
+  uuid     TEXT    NOT NULL,
+  category TEXT    NOT NULL,
+  fights   INTEGER NOT NULL,
+  PRIMARY KEY (uuid, category)
+);
+
+-- Rows read and written per route and day (src/usage.ts, migration 0023); route '*' is the day's total.
+CREATE TABLE IF NOT EXISTS usage_daily (
+  day          TEXT    NOT NULL,
+  route        TEXT    NOT NULL,
+  requests     INTEGER NOT NULL,
+  rows_read    INTEGER NOT NULL,
+  rows_written INTEGER NOT NULL,
+  PRIMARY KEY (day, route)
+);
+
+-- Admin notices (migration 0024): a message an admin sends to players running the mod, in bulk (everyone on an older version than the
+-- newest one in use) or to chosen players. Mods pick pending notices up from their heartbeat (POST /presence) and show them in chat.
+CREATE TABLE IF NOT EXISTS admin_notices (
+  id             INTEGER PRIMARY KEY AUTOINCREMENT,
+  message        TEXT    NOT NULL,
+  created_at     INTEGER NOT NULL,
+  expires_at     INTEGER NOT NULL,
+  created_by     TEXT    NOT NULL,
+  all_outdated   INTEGER NOT NULL,  -- 1: every player on a version older than target_version; 0: only the players in notice_targets
+  target_version TEXT
+);
+
+CREATE TABLE IF NOT EXISTS notice_targets (
+  notice_id INTEGER NOT NULL,
+  uuid      TEXT    NOT NULL,
+  PRIMARY KEY (notice_id, uuid)
+);
+
+CREATE TABLE IF NOT EXISTS notice_deliveries (
+  notice_id    INTEGER NOT NULL,
+  uuid         TEXT    NOT NULL,
+  delivered_at INTEGER NOT NULL,
+  PRIMARY KEY (notice_id, uuid)
 );

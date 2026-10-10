@@ -14,16 +14,23 @@
  *   POST /fights                { fight_key, started_at, ended_at, outcome, opponent, category,
  *                                 swaps: [...], guns: [...], combos: [...] } (logged in)
  *   GET  /players               -> player summaries        (logged in)
- *   GET  /players/:uuid/fights -> one player's last MAX_FIGHTS fights per category, raw, newest first (logged in)
+ *   POST /admin/notify          { message?, names? } -> sends a notice to players (admin only, see adminNotify)
+ *   GET  /players/:uuid/fights?since=ID -> one player's stored fights after fight ID, raw, a page at a time;
+ *                               without since: their newest 100 per category (older mods) (logged in)
  *   GET  /players/:uuid?fights=N&category=C -> one player's full stats over their last N
- *                               (25/50/100) fights of PvP category C, or all fights without it (logged in)
+ *                               (25/50/100/250/500) fights of PvP category C, or all fights without it (logged in)
  *
  * Stats are only recorded during fights: from GTM's combat tag starting to
  * the player's kill or death. The mod uploads each finished fight in one
- * go, and only each player's last MAX_FIGHTS fights of each PvP category are
+ * go, and only each player's last MAX_FIGHTS (500) fights of each PvP category are
  * kept - older ones are deleted as new ones arrive, so a day of Air fights
- * doesn't push out Wing history. Stats are shown over the last 25, 50 or
- * 100 of those.
+ * doesn't push out Wing history. Stats are shown over the last 25, 50, 100,
+ * 250 or 500 of those.
+ *
+ * D1's free plan bills by rows read, so no view walks a whole history or joins
+ * the child tables: every fight carries its totals as a summary (summary.ts)
+ * and a view reads one row per fight; leaderboards are put together from one
+ * stored row per player; and every request's rows are counted (usage.ts).
  *
  * Gun stats come as totals per gun for the fight rather than one row per
  * shot - automatic guns fire many times a second, and per-shot rows would
@@ -34,6 +41,10 @@
  * instead of retrying forever.
  */
 
+import { METRICS, Totals, buildSummary, round2, totalsOf } from "./summary";
+import type { FightRow, Row } from "./summary";
+import { countingDatabase, recordUsage, routeLabel, tightBudget } from "./usage";
+
 export interface Env {
 	DB: D1Database;
 	DEV_UUIDS: string;
@@ -41,13 +52,16 @@ export interface Env {
 	ADMIN_UUIDS: string;
 	/** Oldest mod version allowed to upload fights, e.g. "1.1.0". Empty = no minimum. */
 	MIN_MOD_VERSION?: string;
+	/** Set during a request that met more fights without a summary than it may fill in (healSummaries): its result is not stored as a view. */
+	incomplete?: boolean;
 }
 
-/** Fights kept per player (the most a player's page can show). */
 /** Fights kept per player, per PvP category. */
-const MAX_FIGHTS = 100;
+const MAX_FIGHTS = 500;
 /** How many of a player's last fights their page can show (?fights=N). */
-const FIGHT_VIEWS = [25, 50, 100];
+const FIGHT_VIEWS = [25, 50, 100, 250, 500];
+/** What mods from before the 500-fight history get from the whole-history routes: the newest this many fights per category, as before. */
+const LEGACY_FIGHTS = 100;
 /** The player list, and a player's page by default, are over this many fights. */
 const DEFAULT_VIEW = 25;
 const MAX_SWAPS_PER_FIGHT = 300;
@@ -56,6 +70,8 @@ const MAX_SHOTS_PER_FIGHT = 100_000;
 /** Movement gun speeds above this (blocks/s) are dropped as bogus. */
 const MAX_SPEED_BPS = 500;
 const MAX_FIGHT_MS = 6 * 60 * 60 * 1000;
+/** Most old fights deleted by one upload (a player over the limit by more catches up over their next uploads). */
+const PRUNE_AT_ONCE = 20;
 
 const CHALLENGE_TTL_MS = 60_000;
 const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
@@ -69,24 +85,6 @@ const CATEGORIES = new Set(["GROUND", "WING", "JP", "AIR"]);
 // has jetpack swaps and jetpack <-> wingsuit swaps.
 const SWAP_TYPES = new Set(["WINGSUIT", "JETPACK", "JP_TO_WING", "WING_TO_JP"]);
 
-// Optional per-swap numbers; anything missing or non-finite is stored as NULL.
-const METRICS = [
-	"reach_ms",
-	"slot_to_hotbar_ms",
-	"hotbar_to_close_ms",
-	"wing_to_hotbar_ms",
-	"mouse_deg",
-	"approach_deg",
-	"needed_deg",
-	"efficiency",
-	"away_deg",
-	"overflick_deg",
-	"overflick_peak_deg",
-	"after_deg",
-	// Momentum: horizontal blocks/s before and after a Wing swap into an empty hotbar slot.
-	"speed_before_bps",
-	"speed_after_bps",
-] as const;
 
 // How the inventory opened (see migration 0017). Stored with every swap but not part of METRICS, so the stats views don't read them.
 const INPUT_METRICS = ["cursor_dx", "cursor_dy", "direct_px", "approach_px", "gui_x", "gui_y", "scaled_w", "scaled_h", "gui_scale", "creative", "from_screen"] as const;
@@ -97,12 +95,16 @@ const AFTER_METRICS = ["after_w_ms", "after_a_ms", "after_s_ms", "after_d_ms", "
 const MOVEMENT_KEYS = ["ms", "w_ms", "a_ms", "s_ms", "d_ms", "still_ms", "ground_ms", "sprint_ms", "sneak_ms", "strafe_switches", "fb_switches", "jumps", "distance", "max_bps"] as const;
 
 export default {
-	async fetch(request, env): Promise<Response> {
+	async fetch(request, env, ctx): Promise<Response> {
+		// Every database call is counted (rows read and written), per route and day: see usage.ts.
+		const counted = countingDatabase(env.DB);
 		try {
-			return await route(request, env);
+			return await route(request, { ...env, DB: counted.db });
 		} catch (e) {
 			console.error(e);
 			return json({ error: "internal error" }, 500);
+		} finally {
+			ctx.waitUntil(recordUsage(env.DB, routeLabel(request), counted.used));
 		}
 	},
 } satisfies ExportedHandler<Env>;
@@ -136,6 +138,7 @@ async function route(request: Request, env: Env): Promise<Response> {
 	if (method === "GET" && pathname === "/admin/player-info") return adminPlayerInfo(request, env);
 	if (method === "GET" && pathname === "/admin/flag-rules") return adminFlagRules(request, env);
 	if (method === "GET" && pathname === "/admin/flagged") return adminFlagged(request, env);
+	if (method === "POST" && pathname === "/admin/notify") return adminNotify(request, env);
 	const adminPlayer = pathname.match(/^\/admin\/players\/([0-9a-f]{32})$/);
 	if (method === "DELETE" && adminPlayer) return adminDeletePlayerData(request, env, adminPlayer[1]);
 	const adminFight = pathname.match(/^\/admin\/players\/([0-9a-f]{32})\/fights\/([0-9a-f]{32})$/);
@@ -316,7 +319,108 @@ async function presence(request: Request, env: Env): Promise<Response> {
 		env.DB.prepare("UPDATE players SET last_seen = ? WHERE uuid = ? AND last_seen < ?").bind(now, uuid, now - PRESENCE_MIN_GAP_MS),
 		...(version ? [version] : []),
 	]);
-	return json({ ok: true });
+	return json({ ok: true, notices: await pendingNotices(env, uuid, modVersionOf(request), now) });
+}
+
+// ---- Admin notices ----
+
+/** The wording of a notice when the admin sends none. The mod's notice screen starts from the same text. */
+const DEFAULT_NOTICE = "A new GTMAddOns version is out. Please update: click UPDATE NOW below (or type /gao update), then restart your game once it has downloaded.";
+const NOTICE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+const MAX_NOTICE_LENGTH = 240;
+const MAX_NOTICE_NAMES = 50;
+
+/** What a notice may contain: one line of plain text (no control characters, no colour codes), cut to MAX_NOTICE_LENGTH. */
+export function cleanNotice(text: unknown): string {
+	if (typeof text !== "string") return "";
+	return text.replace(/[\u0000-\u001f\u007f§]/g, " ").replace(/\s+/g, " ").trim().slice(0, MAX_NOTICE_LENGTH);
+}
+
+/**
+ * The notices waiting for this player, at most three, and marks them delivered (each is shown once). A bulk notice (all_outdated)
+ * is for a player whose mod version is older than the notice's target_version; any other only for the players it names.
+ * Called with every heartbeat, so it is two small-table lookups; an empty list before migration 0024.
+ */
+async function pendingNotices(env: Env, uuid: string, version: string | null, now: number): Promise<{ id: number; message: string; target_version: string | null }[]> {
+	try {
+		const { results } = await env.DB.prepare(
+			`SELECT n.id, n.message, n.target_version, n.all_outdated FROM admin_notices n
+			  WHERE n.expires_at > ?
+			    AND NOT EXISTS (SELECT 1 FROM notice_deliveries d WHERE d.notice_id = n.id AND d.uuid = ?)
+			    AND (n.all_outdated = 1 OR EXISTS (SELECT 1 FROM notice_targets t WHERE t.notice_id = n.id AND t.uuid = ?))
+			  ORDER BY n.id LIMIT 3`,
+		).bind(now, uuid, uuid).all<{ id: number; message: string; target_version: string | null; all_outdated: number }>();
+		const mine = results.filter((n) => n.all_outdated === 0 || (version !== null && n.target_version !== null && compareVersions(version, n.target_version) < 0));
+		if (mine.length === 0) return [];
+		const mark = env.DB.prepare("INSERT OR IGNORE INTO notice_deliveries (notice_id, uuid, delivered_at) VALUES (?, ?, ?)");
+		await env.DB.batch(mine.map((n) => mark.bind(n.id, uuid, now)));
+		return mine.map((n) => ({ id: n.id, message: n.message, target_version: n.all_outdated === 1 ? n.target_version : null }));
+	} catch {
+		return []; // table not created yet
+	}
+}
+
+/**
+ * Admin mode: send players a notice (the mod shows it in chat with an update button).
+ *   POST /admin/notify { message?: string, names?: string[] }
+ * With names: only those players (matched ignoring case, at most MAX_NOTICE_NAMES). Without: every player whose mod version is older
+ * than the newest version in use. The message defaults to DEFAULT_NOTICE. A notice waits 7 days; each player gets it once, with their
+ * next heartbeat (every 15 minutes), and only mods new enough to read notices show it. Answers how many players it is for and how many
+ * of them were online (heard from in the last 40 minutes), plus names it could not find.
+ */
+async function adminNotify(request: Request, env: Env): Promise<Response> {
+	const auth = await requireAdmin(request, env);
+	if ("denied" in auth) return auth.denied;
+	const body = await readJson(request);
+	const message = cleanNotice(body?.message) || DEFAULT_NOTICE;
+	const names = [...new Set((Array.isArray(body?.names) ? body.names : [])
+		.filter((n: unknown): n is string => typeof n === "string" && /^[A-Za-z0-9_]{1,16}$/.test(n))
+		.map((n: string) => n.toLowerCase()))].slice(0, MAX_NOTICE_NAMES) as string[];
+	const now = Date.now();
+	const onlineSince = now - PRESENCE_WINDOW_MS;
+
+	let targets: { uuid: string; name: string }[] = [];
+	let unknownNames: string[] = [];
+	let targeted = 0, online = 0;
+	let targetVersion: string | null = null;
+	if (names.length > 0) {
+		const { results } = await env.DB.prepare(`SELECT uuid, name, last_seen FROM players WHERE lower(name) IN (${names.map(() => "?").join(", ")})`)
+			.bind(...names).all<{ uuid: string; name: string; last_seen: number }>();
+		targets = results;
+		const found = new Set(results.map((r) => r.name.toLowerCase()));
+		unknownNames = names.filter((n) => !found.has(n));
+		if (targets.length === 0) return json({ error: "none of those players have used the stats server", unknown_names: unknownNames }, 404);
+		targeted = results.length;
+		online = results.filter((r) => r.last_seen >= onlineSince).length;
+	} else {
+		const { results } = await env.DB.prepare("SELECT mod_version, COUNT(*) AS n, COALESCE(SUM(last_seen >= ?), 0) AS online FROM players WHERE mod_version IS NOT NULL GROUP BY mod_version")
+			.bind(onlineSince).all<{ mod_version: string; n: number; online: number }>();
+		if (results.length === 0) return json({ error: "no mod versions are known yet" }, 400);
+		targetVersion = results.map((r) => r.mod_version).reduce((a, b) => (compareVersions(a, b) >= 0 ? a : b));
+		for (const r of results) {
+			if (compareVersions(r.mod_version, targetVersion) < 0) {
+				targeted += r.n;
+				online += r.online;
+			}
+		}
+	}
+
+	// Expired notices go; then this one.
+	await env.DB.batch([
+		env.DB.prepare("DELETE FROM notice_targets WHERE notice_id IN (SELECT id FROM admin_notices WHERE expires_at <= ?)").bind(now),
+		env.DB.prepare("DELETE FROM notice_deliveries WHERE notice_id IN (SELECT id FROM admin_notices WHERE expires_at <= ?)").bind(now),
+		env.DB.prepare("DELETE FROM admin_notices WHERE expires_at <= ?").bind(now),
+	]);
+	const created = await env.DB.prepare(
+		"INSERT INTO admin_notices (message, created_at, expires_at, created_by, all_outdated, target_version) VALUES (?, ?, ?, ?, ?, ?) RETURNING id",
+	).bind(message, now, now + NOTICE_TTL_MS, auth.admin, targets.length > 0 ? 0 : 1, targetVersion).first<{ id: number }>();
+	const id = created?.id ?? 0;
+	if (targets.length > 0) {
+		const add = env.DB.prepare("INSERT OR IGNORE INTO notice_targets (notice_id, uuid) VALUES (?, ?)");
+		await env.DB.batch(targets.map((t) => add.bind(id, t.uuid)));
+	}
+	console.log(JSON.stringify({ event: "admin_notify", admin: auth.admin, id, mode: targets.length > 0 ? "players" : "outdated", targeted, online, message }));
+	return json({ id, mode: targets.length > 0 ? "players" : "outdated", targeted, online, target_version: targetVersion, unknown_names: unknownNames });
 }
 
 /**
@@ -414,16 +518,27 @@ async function uploadFight(request: Request, env: Env): Promise<Response> {
 		return json({ error: "bad request" }, 400);
 	}
 
-	const existing = await env.DB.prepare("SELECT id FROM fights WHERE uuid = ? AND fight_key = ?").bind(uuid, fightKey).first();
-	if (existing) return json({ stored: 0, duplicate: true });
-
 	const category = typeof body?.category === "string" && CATEGORIES.has(body.category)
 		? body.category
 		: guessCategory(swaps, guns);
 
+	// Is it already stored, and how many fights of this category does the player have (fight_counts, so nothing is counted here)?
+	const [existing, counted] = await env.DB.batch<{ id?: number; fights?: number }>([
+		env.DB.prepare("SELECT id FROM fights WHERE uuid = ? AND fight_key = ?").bind(uuid, fightKey),
+		env.DB.prepare("SELECT fights FROM fight_counts WHERE uuid = ? AND category = ?").bind(uuid, category ?? ""),
+	]);
+	if (existing.results.length > 0) return json({ stored: 0, duplicate: true });
+	const storedFights = counted.results[0]?.fights ?? 0;
+
 	// What the opponent looked like (the mod's GearTracker): a PvP category and a short JSON text of their gear.
 	const opponentCategory = typeof body?.opponent_category === "string" && CATEGORIES.has(body.opponent_category) ? body.opponent_category : null;
 	const opponentGear = typeof body?.opponent_gear === "string" && body.opponent_gear.length > 0 && body.opponent_gear.length <= 1600 ? body.opponent_gear : null;
+
+	// The opponent's timeline (the mod's GearTracker): short JSON text.
+	const opponentTrack = typeof body?.opponent_track === "string" && body.opponent_track.length > 0 && body.opponent_track.length <= 2000 ? body.opponent_track : null;
+
+	// 1 when the mod cut this fight at a conceded net (see the mod's NetFightEnd).
+	const netEnded = body?.net_ended === true ? 1 : null;
 
 	// The movement keys during the fight, kept as JSON text of the known numbers only.
 	let movementInput: string | null = null;
@@ -438,11 +553,9 @@ async function uploadFight(request: Request, env: Env): Promise<Response> {
 
 	// Children find their fight by (uuid, fight_key), so everything can go in one batch.
 	const fightId = "(SELECT id FROM fights WHERE uuid = ? AND fight_key = ?)";
-	const statements: D1PreparedStatement[] = [
-		env.DB.prepare(
-			"INSERT INTO fights (uuid, fight_key, started_at, ended_at, outcome, opponent, category, opponent_category, opponent_gear, movement_input) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-		).bind(uuid, fightKey, startedAt, endedAt, outcome, opponent, category, opponentCategory, opponentGear, movementInput),
-	];
+	// The fight's own row goes in first, but its summary needs the checked children: it is put in front once they are known.
+	const statements: D1PreparedStatement[] = [];
+	const swapRows: Row[] = [], gunRows: Row[] = [], comboRows: Row[] = [];
 
 	const swapColumns = ["uuid", "ts", "result", "category", "swap_type", "total_ms", ...METRICS, ...INPUT_METRICS, ...AFTER_METRICS];
 	const insertSwap = env.DB.prepare(
@@ -458,16 +571,23 @@ async function uploadFight(request: Request, env: Env): Promise<Response> {
 			return json({ error: "bad swap record" }, 400);
 		}
 		const ts = clampTs(finiteOrNull(s.ts) ?? now, now);
+		const metrics = METRICS.map((m) => finiteOrNull(s[m]));
 		statements.push(insertSwap.bind(uuid, fightKey, uuid, ts, s.result, s.category, swapType, totalMs,
-			...METRICS.map((m) => finiteOrNull(s[m])), ...INPUT_METRICS.map((m) => finiteOrNull(s[m])), ...AFTER_METRICS.map((m) => finiteOrNull(s[m]))));
+			...metrics, ...INPUT_METRICS.map((m) => finiteOrNull(s[m])), ...AFTER_METRICS.map((m) => finiteOrNull(s[m]))));
+		const kept: Row = { ts, result: s.result, category: s.category, swap_type: swapType, total_ms: totalMs };
+		METRICS.forEach((m, i) => (kept[m] = metrics[i]));
+		swapRows.push(kept);
 	}
 
 	const insertGun = env.DB.prepare(
-		`INSERT INTO fight_guns (fight_id, uuid, category, gun, shots, hits, headshots, kills, speed_shots, speed_total_bps, speed_best_bps)
-		 VALUES (${fightId}, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		`INSERT INTO fight_guns (fight_id, uuid, category, gun, shots, hits, headshots, kills, speed_shots, speed_total_bps, speed_best_bps, net_shots, net_hits, net_headshots)
+		 VALUES (${fightId}, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT (fight_id, category, gun) DO UPDATE SET
 		   shots = shots + excluded.shots, hits = hits + excluded.hits,
 		   headshots = headshots + excluded.headshots, kills = kills + excluded.kills,
+		   net_shots = CASE WHEN excluded.net_shots IS NULL THEN net_shots ELSE COALESCE(net_shots, 0) + excluded.net_shots END,
+		   net_hits = CASE WHEN excluded.net_hits IS NULL THEN net_hits ELSE COALESCE(net_hits, 0) + excluded.net_hits END,
+		   net_headshots = CASE WHEN excluded.net_headshots IS NULL THEN net_headshots ELSE COALESCE(net_headshots, 0) + excluded.net_headshots END,
 		   speed_shots = CASE WHEN excluded.speed_shots IS NULL THEN speed_shots ELSE COALESCE(speed_shots, 0) + excluded.speed_shots END,
 		   speed_total_bps = CASE WHEN excluded.speed_total_bps IS NULL THEN speed_total_bps ELSE COALESCE(speed_total_bps, 0) + excluded.speed_total_bps END,
 		   speed_best_bps = MAX(COALESCE(speed_best_bps, excluded.speed_best_bps), COALESCE(excluded.speed_best_bps, speed_best_bps))`,
@@ -489,8 +609,15 @@ async function uploadFight(request: Request, env: Env): Promise<Response> {
 		const hasSpeed = speedShots !== null && speedShots > 0 && speedShots <= shots &&
 			speedTotal !== null && speedBest !== null && speedBest >= 0 && speedBest <= MAX_SPEED_BPS &&
 			speedTotal >= 0 && speedTotal <= speedBest * speedShots + 0.001;
+		// Shots at a netted player (Net Launcher): all three or none, consistent with the totals; bad values are dropped, not the fight.
+		const [netShots, netHits, netHeadshots] = [g.net_shots, g.net_hits, g.net_headshots].map(countOrNull);
+		const hasNet = netShots !== null && netHits !== null && netHeadshots !== null && netShots <= shots && netHits <= netShots && netHits <= hits && netHeadshots <= netHits && netHeadshots <= headshots;
 		statements.push(insertGun.bind(uuid, fightKey, uuid, category, gun, shots, hits, headshots, kills,
-			hasSpeed ? speedShots : null, hasSpeed ? speedTotal : null, hasSpeed ? speedBest : null));
+			hasSpeed ? speedShots : null, hasSpeed ? speedTotal : null, hasSpeed ? speedBest : null,
+			hasNet ? netShots : null, hasNet ? netHits : null, hasNet ? netHeadshots : null));
+		gunRows.push({ category, gun, shots, hits, headshots, kills,
+			speed_shots: hasSpeed ? speedShots : null, speed_total_bps: hasSpeed ? speedTotal : null, speed_best_bps: hasSpeed ? speedBest : null,
+			net_shots: hasNet ? netShots : null, net_hits: hasNet ? netHits : null, net_headshots: hasNet ? netHeadshots : null });
 	}
 
 	const insertCombo = env.DB.prepare(
@@ -512,19 +639,36 @@ async function uploadFight(request: Request, env: Env): Promise<Response> {
 		// versions don't send them (null); bad values are dropped, not rejected.
 		const enemyFirst = countOrNull(c.enemy_first_hits);
 		const ownFirst = countOrNull(c.own_first_hits);
-		statements.push(insertCombo.bind(uuid, fightKey, uuid, category, enemy, enemyBroken, own, ownBroken,
-			enemyFirst !== null && enemyFirst <= enemy ? enemyFirst : null,
-			ownFirst !== null && ownFirst <= own ? ownFirst : null));
+		const firstEnemy = enemyFirst !== null && enemyFirst <= enemy ? enemyFirst : null;
+		const firstOwn = ownFirst !== null && ownFirst <= own ? ownFirst : null;
+		statements.push(insertCombo.bind(uuid, fightKey, uuid, category, enemy, enemyBroken, own, ownBroken, firstEnemy, firstOwn));
+		comboRows.push({ category, enemy_combos: enemy, enemy_broken: enemyBroken, own_combos: own, own_broken: ownBroken,
+			enemy_first_hits: firstEnemy, own_first_hits: firstOwn });
 	}
 
-	// Keep only the last MAX_FIGHTS fights of this category (children first, then the fights). Only the
-	// fights past the limit are looked at, so this reads ~MAX_FIGHTS index rows (fights_uuid_category_ended)
-	// rather than every row the player has.
-	const old = `SELECT id FROM fights WHERE uuid = ? AND category = ? ORDER BY ended_at DESC, id DESC LIMIT -1 OFFSET ${MAX_FIGHTS}`;
-	for (const table of ["swaps", "fight_guns", "fight_combos"]) {
-		statements.push(env.DB.prepare(`DELETE FROM ${table} WHERE fight_id IN (${old})`).bind(uuid, category));
+	// The fight itself, with its totals as a summary (see summary.ts): every stats view reads that one row instead of the children.
+	statements.unshift(
+		env.DB.prepare(
+			"INSERT INTO fights (uuid, fight_key, started_at, ended_at, outcome, opponent, category, opponent_category, opponent_gear, movement_input, opponent_track, net_ended, summary) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+		).bind(uuid, fightKey, startedAt, endedAt, outcome, opponent, category, opponentCategory, opponentGear, movementInput, opponentTrack, netEnded,
+			JSON.stringify(buildSummary(swapRows, gunRows, comboRows))),
+	);
+
+	// Keep only the newest MAX_FIGHTS fights of this category (children first, then the fights). The player's count is kept in
+	// fight_counts, so nothing is looked at until they are over the limit, and then only the oldest few (by index).
+	if (category) {
+		const excess = Math.min(PRUNE_AT_ONCE, storedFights + 1 - MAX_FIGHTS);
+		if (excess > 0) {
+			const old = `SELECT id FROM fights WHERE uuid = ? AND category = ? ORDER BY ended_at, id LIMIT ${excess}`;
+			for (const table of ["swaps", "fight_guns", "fight_combos"]) {
+				statements.push(env.DB.prepare(`DELETE FROM ${table} WHERE fight_id IN (${old})`).bind(uuid, category));
+			}
+			statements.push(env.DB.prepare(`DELETE FROM fights WHERE id IN (${old})`).bind(uuid, category));
+		}
+		statements.push(env.DB.prepare(
+			"INSERT INTO fight_counts (uuid, category, fights) VALUES (?, ?, 1) ON CONFLICT (uuid, category) DO UPDATE SET fights = fights + 1 - ?",
+		).bind(uuid, category, Math.max(0, excess)));
 	}
-	statements.push(env.DB.prepare(`DELETE FROM fights WHERE id IN (${old})`).bind(uuid, category));
 	statements.push(env.DB.prepare("UPDATE players SET last_seen = ? WHERE uuid = ?").bind(now, uuid));
 	if (category) statements.push(dirtyStatement(env, uuid, category));
 	const version = modVersionStatement(env, request, uuid);
@@ -581,19 +725,63 @@ function clampTs(ts: number, now: number): number {
 
 // ---- Viewing stats ----
 // Each player's last MAX_FIGHTS fights of each category are stored. A player's page asks for
-// their last 25, 50 or 100 fights of one PvP category
+// their last 25, 50, 100, 250 or 500 fights of one PvP category
 // (?fights=N&category=JP), so each tab is over that kind of fight.
 
+/** A fight as the stats views read it: one row, with its totals in summary (see summary.ts). */
+type StoredFight = FightRow & { id: number };
+const FIGHT_COLUMNS = "id, uuid, outcome, opponent, started_at, ended_at, summary, opponent_category";
+
 /**
- * The ids of a player's last n fights (of one category, if given), for
- * `fight_id IN (...)`. Binds the uuid. category must already be checked
- * against CATEGORIES - it's written into the SQL.
+ * A player's newest n fights (of one category, if given), newest first. Reads n rows, by index, however long their history is.
+ * category must already be checked against CATEGORIES - it's written into the SQL.
  */
-function lastFights(n: number, category: string | null = null): string {
-	const only = category !== null && CATEGORIES.has(category) ? ` AND f.category = '${category}'` : "";
-	return `SELECT f.id FROM fights f WHERE f.uuid = ?${only} ORDER BY f.ended_at DESC, f.id DESC LIMIT ${n}`;
+function newestFights(env: Env, uuid: string, n: number, category: string | null): D1PreparedStatement {
+	const only = category !== null && CATEGORIES.has(category) ? ` AND category = '${category}'` : "";
+	return env.DB.prepare(`SELECT ${FIGHT_COLUMNS} FROM fights WHERE uuid = ?${only} ORDER BY ended_at DESC, id DESC LIMIT ${n}`).bind(uuid);
 }
 
+/** Fights summarised per database call, and per request, when some have no summary yet. */
+const HEAL_CHUNK = 60;
+const HEAL_MAX = 240;
+
+/**
+ * Fights stored before summaries existed (or by a worker version from before them) have none: work it out from their swaps, gun
+ * totals and combo totals, keep it, and fill it in on the rows given. At most HEAL_MAX per request; any left count as fights
+ * without swaps or shots in this answer (marked incomplete, so it is not kept as a view) and are reached by later requests.
+ */
+async function healSummaries(env: Env, fights: StoredFight[]): Promise<void> {
+	const all = fights.filter((f) => f.summary === null);
+	if (all.length > HEAL_MAX) env.incomplete = true;
+	const missing = all.slice(0, HEAL_MAX);
+	for (let at = 0; at < missing.length; at += HEAL_CHUNK) {
+		const part = missing.slice(at, at + HEAL_CHUNK);
+		// Ids straight from the database, so they are safe to write into the SQL.
+		const ids = part.map((f) => Math.trunc(f.id)).join(", ");
+		const [swaps, guns, combos] = await env.DB.batch<Row>([
+			env.DB.prepare(`SELECT fight_id, ts, result, category, swap_type, total_ms, ${METRICS.join(", ")} FROM swaps WHERE fight_id IN (${ids})`),
+			env.DB.prepare(
+				`SELECT fight_id, category, gun, shots, hits, headshots, kills, speed_shots, speed_total_bps, speed_best_bps, net_shots, net_hits, net_headshots
+				   FROM fight_guns WHERE fight_id IN (${ids})`,
+			),
+			env.DB.prepare(
+				`SELECT fight_id, category, enemy_combos, enemy_broken, own_combos, own_broken, enemy_first_hits, own_first_hits
+				   FROM fight_combos WHERE fight_id IN (${ids})`,
+			),
+		]);
+		const of = (rows: Row[], id: number) => rows.filter((r) => r.fight_id === id);
+		const update = env.DB.prepare("UPDATE fights SET summary = ? WHERE id = ? AND summary IS NULL");
+		await env.DB.batch(part.map((f) => {
+			f.summary = JSON.stringify(buildSummary(of(swaps.results, f.id), of(guns.results, f.id), of(combos.results, f.id)));
+			return update.bind(f.summary, f.id);
+		}));
+	}
+}
+
+/**
+ * One player's stats over their newest N fights (of one PvP category, or of all without it): one row read per fight, added up
+ * from the fights' summaries.
+ */
 async function playerDetail(request: Request, env: Env, uuid: string): Promise<Response> {
 	if (!(await authenticate(request, env))) return json({ error: "not logged in" }, 401);
 	const player = await env.DB.prepare("SELECT uuid, name, first_seen, last_seen FROM players WHERE uuid = ?")
@@ -606,104 +794,21 @@ async function playerDetail(request: Request, env: Env, uuid: string): Promise<R
 	const n = FIGHT_VIEWS.includes(asked) ? asked : DEFAULT_VIEW;
 	const askedCategory = params.get("category");
 	const category = askedCategory !== null && CATEGORIES.has(askedCategory) ? askedCategory : null;
-	// Every query below is limited to these fights; each use binds the uuid once more.
-	const inView = `fight_id IN (${lastFights(n, category)})`;
 
-	const averages = ["total_ms", ...METRICS].map((m) => `AVG(${m}) AS ${m}`).join(", ");
-	const [fights, counts, avg, recent, guns, airSwaps, combos, recentFights, movementGuns, airAvg] = await env.DB.batch([
-		env.DB.prepare(
-			`SELECT COUNT(*)                              AS fights,
-			        COALESCE(SUM(outcome = 'KILL'), 0)    AS kills,
-			        COALESCE(SUM(outcome = 'DEATH'), 0)   AS deaths
-			   FROM fights WHERE id IN (${lastFights(n, category)})`,
-		).bind(uuid),
-		env.DB.prepare(
-			`SELECT COUNT(*)                                              AS total,
-			        COALESCE(SUM(result = 'SUCCESS'), 0)                  AS successes,
-			        COALESCE(SUM(result = 'FAILED'), 0)                   AS failures,
-			        COALESCE(SUM(result = 'CANCELED'), 0)                 AS cancels,
-			        MIN(CASE WHEN result = 'SUCCESS' THEN total_ms END)   AS best_ms
-			   FROM swaps WHERE category = 'WING' AND ${inView}`,
-		).bind(uuid),
-		// Averages only over successful swaps, so failed/canceled ones don't skew them.
-		env.DB.prepare(
-			`SELECT ${averages} FROM swaps WHERE category = 'WING' AND result = 'SUCCESS' AND ${inView}`,
-		).bind(uuid),
-		env.DB.prepare(
-			`SELECT ts, result, total_ms, wing_to_hotbar_ms, efficiency, overflick_deg
-			   FROM swaps WHERE category = 'WING' AND ${inView} ORDER BY ts DESC LIMIT 15`,
-		).bind(uuid),
-		env.DB.prepare(
-			`SELECT g.category, g.gun, SUM(g.shots) AS shots, SUM(g.hits) AS hits, SUM(g.headshots) AS headshots,
-			        SUM(g.kills) AS kills, MAX(f.ended_at) AS last_used
-			   FROM fight_guns g JOIN fights f ON f.id = g.fight_id
-			  WHERE g.${inView}
-			  GROUP BY g.category, g.gun
-			  ORDER BY shots DESC LIMIT 80`,
-		).bind(uuid),
-		// Air PvP swaps per type; failed/canceled attempts have no type and group as null.
-		env.DB.prepare(
-			`SELECT swap_type,
-			        COUNT(*)                                              AS total,
-			        COALESCE(SUM(result = 'SUCCESS'), 0)                  AS successes,
-			        COALESCE(SUM(result = 'CANCELED'), 0)                 AS cancels,
-			        AVG(CASE WHEN result = 'SUCCESS' THEN total_ms END)   AS avg_ms,
-			        MIN(CASE WHEN result = 'SUCCESS' THEN total_ms END)   AS best_ms,
-			        AVG(CASE WHEN result = 'SUCCESS' AND speed_after_bps IS NOT NULL THEN speed_before_bps END) AS speed_before_bps,
-			        AVG(CASE WHEN result = 'SUCCESS' AND speed_before_bps IS NOT NULL THEN speed_after_bps END) AS speed_after_bps,
-			        COALESCE(SUM(result = 'SUCCESS' AND speed_before_bps IS NOT NULL AND speed_after_bps IS NOT NULL), 0) AS momentum_swaps
-			   FROM swaps WHERE category = 'AIR' AND ${inView}
-			  GROUP BY swap_type`,
-		).bind(uuid),
-		env.DB.prepare(
-			`SELECT category, SUM(enemy_combos) AS enemy_combos, SUM(enemy_broken) AS enemy_broken,
-			        SUM(own_combos) AS own_combos, SUM(own_broken) AS own_broken,
-			        COALESCE(SUM(enemy_first_hits), 0) AS enemy_first_hits,
-			        COALESCE(SUM(own_first_hits), 0) AS own_first_hits
-			   FROM fight_combos WHERE ${inView}
-			  GROUP BY category`,
-		).bind(uuid),
-		// The last few fights in the view, newest first, for the fights strip.
-		env.DB.prepare(
-			`SELECT outcome, opponent, started_at, ended_at
-			   FROM fights WHERE id IN (${lastFights(n, category)})
-			  ORDER BY ended_at DESC, id DESC LIMIT 10`,
-		).bind(uuid),
-		// Ground PvP movement guns: horizontal speed right after their shots, per gun.
-		env.DB.prepare(
-			`SELECT gun, SUM(speed_shots) AS shots, SUM(speed_total_bps) / SUM(speed_shots) AS avg_bps,
-			        MAX(speed_best_bps) AS best_bps
-			   FROM fight_guns WHERE category = 'GROUND' AND speed_shots > 0 AND ${inView}
-			  GROUP BY gun ORDER BY shots DESC`,
-		).bind(uuid),
-		// Air PvP swaps: the same averages as Wing's (mouse movement and steps), over all successful Air swaps.
-		env.DB.prepare(`SELECT ${averages} FROM swaps WHERE category = 'AIR' AND result = 'SUCCESS' AND ${inView}`).bind(uuid),
-	]);
-
-	return json({
-		...player,
-		...(fights.results[0] as object),
-		...(counts.results[0] as object),
-		avg: avg.results[0],
-		recent: recent.results,
-		guns: guns.results,
-		air_swaps: airSwaps.results,
-		combos: combos.results,
-		recent_fights: recentFights.results,
-		movement_guns: movementGuns.results,
-		air_avg: airAvg.results[0],
-	});
+	const fights = (await newestFights(env, uuid, n, category).all<StoredFight>()).results;
+	await healSummaries(env, fights);
+	return json({ ...player, ...totalsOf(fights, n).detail() });
 }
 
 /** How long a player's raw data is kept before it is read again, and the most swap rows it holds. */
 const RAW_TTL_S = 900;
 const RAW_MAX_SWAPS = 4000;
 /** Columns that are the same on every row or only link rows together, so they are not sent. */
-const RAW_SKIP = new Set(["id", "uuid", "fight_id"]);
+const RAW_SKIP = new Set(["id", "uuid", "fight_id", "summary"]);
 
 /**
- * Everything the backend stores about one player, as it is stored: the player row and, for the fights it keeps (the last MAX_FIGHTS of
- * each category), the fights, their swaps, gun totals and combo totals (SELECT *, so a column added later is included automatically).
+ * What the backend stores about one player, as it is stored: the player row and, for their newest LEGACY_FIGHTS fights of each
+ * category (a whole 500-fight history would not fit one reply), the fights, their swaps, gun totals and combo totals (SELECT *, so a column added later is included automatically).
  * Open to every logged-in player - it is the same data the stats screens are built from, and what the admin flags are computed from.
  * Sent column-wise to keep it small: { player, fights: { cols, rows }, swaps: { cols, rows, fight }, ... } where each row is an array of
  * values in cols order (null = not recorded), numbers rounded to 2 decimals, and "fight" gives each child row its fight's row number.
@@ -713,18 +818,18 @@ async function playerRaw(request: Request, env: Env, uuid: string): Promise<Resp
 	if (!(await authenticate(request, env))) return json({ error: "not logged in" }, 401);
 	const headers = { "Content-Type": "application/json" };
 	const key = `raw-${uuid}`;
-	const stored = await readStoredView(env, key, RAW_TTL_S);
+	const stored = await readStoredView(env, key, tightBudget() ? TIGHT_TTL_S : RAW_TTL_S);
 	if (stored) return new Response(stored, { headers });
 
 	const player = await env.DB.prepare("SELECT uuid, name, first_seen, last_seen, mod_version FROM players WHERE uuid = ?").bind(uuid).first();
 	if (!player) return json({ error: "no such player" }, 404);
-	const kept = `SELECT id FROM (SELECT id, ROW_NUMBER() OVER (PARTITION BY category ORDER BY ended_at DESC, id DESC) AS rn
-		FROM fights WHERE uuid = ?) WHERE rn <= ${MAX_FIGHTS}`;
+	const kept = newestPerCategory(LEGACY_FIGHTS);
+	const uuids = Array<string>(PER_CATEGORY_BINDS).fill(uuid);
 	const [fights, swaps, guns, combos] = await env.DB.batch([
-		env.DB.prepare(`SELECT * FROM fights WHERE id IN (${kept}) ORDER BY ended_at DESC, id DESC`).bind(uuid),
-		env.DB.prepare(`SELECT * FROM swaps WHERE fight_id IN (${kept}) ORDER BY ts DESC LIMIT ${RAW_MAX_SWAPS}`).bind(uuid),
-		env.DB.prepare(`SELECT * FROM fight_guns WHERE fight_id IN (${kept})`).bind(uuid),
-		env.DB.prepare(`SELECT * FROM fight_combos WHERE fight_id IN (${kept})`).bind(uuid),
+		env.DB.prepare(`SELECT * FROM fights WHERE id IN (${kept}) ORDER BY ended_at DESC, id DESC`).bind(...uuids),
+		env.DB.prepare(`SELECT * FROM swaps WHERE fight_id IN (${kept}) ORDER BY ts DESC LIMIT ${RAW_MAX_SWAPS}`).bind(...uuids),
+		env.DB.prepare(`SELECT * FROM fight_guns WHERE fight_id IN (${kept})`).bind(...uuids),
+		env.DB.prepare(`SELECT * FROM fight_combos WHERE fight_id IN (${kept})`).bind(...uuids),
 	]);
 
 	const fightRows = fights.results as Record<string, unknown>[];
@@ -753,80 +858,113 @@ async function playerRaw(request: Request, env: Env, uuid: string): Promise<Resp
 
 /** Most swap rows sent with one player's fight list (newest first), so a huge history can't make an enormous reply. */
 const MAX_SWAPS_IN_FIGHT_LIST = 5000;
+/** Fights sent per request when a mod catches up with a history (?since=): it asks again while "more" is true. */
+const SYNC_PAGE = 250;
 
 /**
- * One player's last MAX_FIGHTS fights of each category, newest first, each with its own swaps,
- * gun totals and combo totals - the raw material for the fight log, per-fight
- * ratings and custom filters (fight count, opponents), which the mod works out
- * itself. Only Wing and Air swaps are sent (the only ones ever shown). Numbers
- * are rounded to keep the reply small.
+ * The ids of a player's newest n fights of each category (and of those with none), for `id IN (...)`. Reads n index rows per
+ * category instead of ranking the whole history. Binds the uuid PER_CATEGORY_BINDS times.
  */
-async function playerFights(request: Request, env: Env, uuid: string): Promise<Response> {
-	if (!(await authenticate(request, env))) return json({ error: "not logged in" }, 401);
-	const player = await env.DB.prepare("SELECT uuid, name, first_seen, last_seen FROM players WHERE uuid = ?")
-		.bind(uuid)
-		.first();
-	if (!player) return json({ error: "no such player" }, 404);
+function newestPerCategory(n: number): string {
+	const one = (where: string) => `SELECT id FROM (SELECT id FROM fights WHERE uuid = ? AND ${where} ORDER BY ended_at DESC, id DESC LIMIT ${n})`;
+	return [...[...CATEGORIES].map((c) => one(`category = '${c}'`)), one("category IS NULL")].join(" UNION ALL ");
+}
+const PER_CATEGORY_BINDS = CATEGORIES.size + 1;
 
-	const kept = `SELECT id FROM (SELECT id, ROW_NUMBER() OVER (PARTITION BY category ORDER BY ended_at DESC, id DESC) AS rn
-		FROM fights WHERE uuid = ?) WHERE rn <= ${MAX_FIGHTS}`;
-	const [fights, swaps, guns, combos] = await env.DB.batch([
-		env.DB.prepare(
-			`SELECT id, fight_key, started_at, ended_at, outcome, opponent, category
-			   FROM fights WHERE id IN (${kept}) ORDER BY ended_at DESC, id DESC`,
-		).bind(uuid),
-		env.DB.prepare(
-			`SELECT fight_id, ts, result, category, swap_type, total_ms, ${METRICS.join(", ")}
-			   FROM swaps WHERE category IN ('WING', 'AIR') AND fight_id IN (${kept})
-			  ORDER BY ts DESC LIMIT ${MAX_SWAPS_IN_FIGHT_LIST}`,
-		).bind(uuid),
-		env.DB.prepare(
-			`SELECT fight_id, category, gun, shots, hits, headshots, kills, speed_shots, speed_total_bps, speed_best_bps
-			   FROM fight_guns WHERE fight_id IN (${kept})`,
-		).bind(uuid),
-		env.DB.prepare(
-			`SELECT fight_id, category, enemy_combos, enemy_broken, own_combos, own_broken,
-			        enemy_first_hits, own_first_hits
-			   FROM fight_combos WHERE fight_id IN (${kept})`,
-		).bind(uuid),
-	]);
-
-	// Group the children under their fight, dropping the fight id and tidying numbers.
-	const byFight = (rows: Record<string, unknown>[]) => {
-		const groups = new Map<number, Record<string, unknown>[]>();
+/** Fights with their swaps, gun totals and combo totals grouped under them; numbers tidied, the fight id kept only if asked. */
+function groupFights(fights: Row[], swaps: Row[], guns: Row[], combos: Row[], keepId: boolean): Row[] {
+	const byFight = (rows: Row[]) => {
+		const groups = new Map<number, Row[]>();
 		for (const row of rows) {
 			const { fight_id, ...rest } = row;
 			const id = fight_id as number;
 			if (!groups.has(id)) groups.set(id, []);
-			groups.get(id)!.push(roundNumbers(rest));
+			groups.get(id)!.push(round2(rest));
 		}
 		return groups;
 	};
-	const swapsByFight = byFight(swaps.results as Record<string, unknown>[]);
-	const gunsByFight = byFight(guns.results as Record<string, unknown>[]);
-	const combosByFight = byFight(combos.results as Record<string, unknown>[]);
-
-	return json({
-		...player,
-		fights: (fights.results as Record<string, unknown>[]).map((f) => {
-			const { id, ...rest } = f;
-			return {
-				...rest,
-				swaps: swapsByFight.get(id as number) ?? [],
-				guns: gunsByFight.get(id as number) ?? [],
-				combos: combosByFight.get(id as number) ?? [],
-			};
-		}),
+	const swapsByFight = byFight(swaps), gunsByFight = byFight(guns), combosByFight = byFight(combos);
+	return fights.map((f) => {
+		const { id, ...rest } = f;
+		return {
+			...(keepId ? { id } : {}),
+			...rest,
+			swaps: swapsByFight.get(id as number) ?? [],
+			guns: gunsByFight.get(id as number) ?? [],
+			combos: combosByFight.get(id as number) ?? [],
+		};
 	});
 }
 
-/** Rounds every non-integer number in a row to 2 decimals (times, degrees, speeds). */
-function roundNumbers(row: Record<string, unknown>): Record<string, unknown> {
-	const out: Record<string, unknown> = {};
-	for (const [key, value] of Object.entries(row)) {
-		out[key] = typeof value === "number" && !Number.isInteger(value) ? Math.round(value * 100) / 100 : value;
+const FIGHT_LIST_SWAPS = `fight_id, ts, result, category, swap_type, total_ms, ${METRICS.join(", ")}`;
+const FIGHT_LIST_GUNS = "fight_id, category, gun, shots, hits, headshots, kills, speed_shots, speed_total_bps, speed_best_bps, net_shots, net_hits, net_headshots";
+const FIGHT_LIST_COMBOS = "fight_id, category, enemy_combos, enemy_broken, own_combos, own_broken, enemy_first_hits, own_first_hits";
+
+/**
+ * One player's stored fights, each with its own swaps, gun totals and combo totals - the raw material for the fight log,
+ * per-fight ratings and custom filters (fight count, opponents), which the mod works out itself. Only Wing and Air swaps are
+ * sent (the only ones ever shown). Numbers are rounded to keep the reply small.
+ *
+ *   GET /players/:uuid/fights?since=ID   the mod keeps what it has read (FightCache) and asks only for fights stored after
+ *       the last one it has: up to SYNC_PAGE fights with an id above ID, oldest first, each with its id; "cursor" is the id
+ *       to ask from next and "more" says whether to ask again straight away. since=0 reads the whole history, page by page.
+ *       "max_fights" is how many fights per category are kept (the mod drops older ones itself, as the backend does), and
+ *       "epoch" changes when an admin deletes any of the player's data: the mod then throws its copy away and starts from 0.
+ *       A fight is never changed once stored, so a repeat visit with nothing new costs two row reads.
+ *   GET /players/:uuid/fights            mods from before that: the newest LEGACY_FIGHTS fights of each category, newest first.
+ */
+async function playerFights(request: Request, env: Env, uuid: string): Promise<Response> {
+	if (!(await authenticate(request, env))) return json({ error: "not logged in" }, 401);
+	const player = await env.DB.prepare("SELECT uuid, name, first_seen, last_seen, data_epoch FROM players WHERE uuid = ?")
+		.bind(uuid)
+		.first<{ uuid: string; name: string; first_seen: number; last_seen: number; data_epoch: number | null }>();
+	if (!player) return json({ error: "no such player" }, 404);
+	const { data_epoch, ...shown } = player;
+
+	const since = new URL(request.url).searchParams.get("since");
+	if (since !== null) {
+		const cursor = Math.max(0, Math.trunc(Number(since)) || 0);
+		const page = (await env.DB.prepare(
+			`SELECT id, fight_key, started_at, ended_at, outcome, opponent, category, opponent_category
+			   FROM fights WHERE uuid = ? AND id > ? ORDER BY id LIMIT ${SYNC_PAGE + 1}`,
+		).bind(uuid, cursor).all<Row>()).results;
+		const more = page.length > SYNC_PAGE;
+		const fights = page.slice(0, SYNC_PAGE);
+		let children: Row[][] = [[], [], []];
+		if (fights.length > 0) {
+			// Ids straight from the database, so they are safe to write into the SQL.
+			const ids = fights.map((f) => Math.trunc(f.id as number)).join(", ");
+			children = (await env.DB.batch<Row>([
+				env.DB.prepare(`SELECT ${FIGHT_LIST_SWAPS} FROM swaps WHERE category IN ('WING', 'AIR') AND fight_id IN (${ids}) ORDER BY ts DESC`),
+				env.DB.prepare(`SELECT ${FIGHT_LIST_GUNS} FROM fight_guns WHERE fight_id IN (${ids})`),
+				env.DB.prepare(`SELECT ${FIGHT_LIST_COMBOS} FROM fight_combos WHERE fight_id IN (${ids})`),
+			])).map((r) => r.results);
+		}
+		return json({
+			...shown,
+			epoch: data_epoch ?? 0,
+			max_fights: MAX_FIGHTS,
+			cursor: fights.length > 0 ? fights[fights.length - 1].id : cursor,
+			more,
+			fights: groupFights(fights, children[0], children[1], children[2], true),
+		});
 	}
-	return out;
+
+	const kept = newestPerCategory(LEGACY_FIGHTS);
+	const uuids = Array<string>(PER_CATEGORY_BINDS).fill(uuid);
+	const [fights, swaps, guns, combos] = await env.DB.batch<Row>([
+		env.DB.prepare(
+			`SELECT id, fight_key, started_at, ended_at, outcome, opponent, category, opponent_category
+			   FROM fights WHERE id IN (${kept}) ORDER BY ended_at DESC, id DESC`,
+		).bind(...uuids),
+		env.DB.prepare(
+			`SELECT ${FIGHT_LIST_SWAPS} FROM swaps WHERE category IN ('WING', 'AIR') AND fight_id IN (${kept})
+			  ORDER BY ts DESC LIMIT ${MAX_SWAPS_IN_FIGHT_LIST}`,
+		).bind(...uuids),
+		env.DB.prepare(`SELECT ${FIGHT_LIST_GUNS} FROM fight_guns WHERE fight_id IN (${kept})`).bind(...uuids),
+		env.DB.prepare(`SELECT ${FIGHT_LIST_COMBOS} FROM fight_combos WHERE fight_id IN (${kept})`).bind(...uuids),
+	]);
+	return json({ ...shown, fights: groupFights(fights.results, swaps.results, guns.results, combos.results, false) });
 }
 
 // ---- Leaderboard ----
@@ -866,7 +1004,7 @@ export async function clearLeaderboards(env: Env): Promise<void> {
 /**
  * Everyone's stats for one PvP category, ready for the mod to rate and rank:
  *   GET /leaderboard?category=WING&fights=25&opponents=alice,bob
- * Each player is measured over their newest `fights` (1-100) fights of that
+ * Each player is measured over their newest `fights` (1-MAX_FIGHTS) fights of that
  * category, counting only fights against `opponents` if any are given (names
  * matched ignoring case). Players with no such fights are left out. Each
  * entry is shaped like a /players/:uuid answer but carries only what that
@@ -897,12 +1035,21 @@ async function leaderboard(request: Request, env: Env): Promise<Response> {
 		.sort()
 		.slice(0, MAX_OPPONENT_FILTER);
 
-	// Every view is stored in D1 for LEADERBOARD_TTL_S (the Cache API does nothing on workers.dev),
-	// so each view's ranking queries run at most once per period, for everyone.
+	return new Response(await leaderboardBody(env, category, n, opponents), { headers: { "Content-Type": "application/json" } });
+}
+
+/** How old a stored view may be served once the day's row budget is tight (see usage.ts): stored views live an hour at most. */
+const TIGHT_TTL_S = 3600;
+
+/**
+ * One leaderboard view as JSON text. Every view is stored in D1 for LEADERBOARD_TTL_S (the Cache API does nothing on
+ * workers.dev), so each view is worked out at most once per period, for everyone.
+ */
+async function leaderboardBody(env: Env, category: string, n: number, opponents: string[]): Promise<string> {
 	const key = `${category}|${n}|${opponents.join(",")}`;
-	const stored = await readStoredView(env, key);
-	if (stored) return new Response(stored, { headers: { "Content-Type": "application/json" } });
-	// Plain 25 / 50 / 100 views are put together from each player's stored row (rebuilding only the players whose
+	const stored = await readStoredView(env, key, tightBudget() ? TIGHT_TTL_S : LEADERBOARD_TTL_S);
+	if (stored) return stored;
+	// Plain views of the usual sizes are put together from each player's stored row (rebuilding only the players whose
 	// fights changed); opponent-filtered views and other sizes, or any trouble with the rows, compute in full.
 	let body: string | null = null;
 	if (opponents.length === 0 && ROW_WINDOWS.includes(n)) {
@@ -913,278 +1060,143 @@ async function leaderboard(request: Request, env: Env): Promise<Response> {
 		}
 	}
 	body ??= await computeLeaderboard(env, category, n, opponents);
-	await storeView(env, key, body);
-	return new Response(body, { headers: { "Content-Type": "application/json" } });
+	if (!env.incomplete) await storeView(env, key, body);
+	return body;
 }
 
-/** The ranking queries for one leaderboard view, as the JSON the mod reads. */
-export async function computeLeaderboard(env: Env, category: string, n: number, opponents: string[]): Promise<string> {
-	// category, n and the names are validated above, so they're safe to write into the SQL.
-	const opponentClause = opponents.length ? ` AND lower(opponent) IN (${opponents.map((o) => `'${o}'`).join(", ")})` : "";
-	const picked =
-		`WITH ranked AS (SELECT id, uuid, outcome, ROW_NUMBER() OVER (PARTITION BY uuid ORDER BY ended_at DESC, id DESC) AS rn ` +
-		`FROM fights WHERE category = '${category}'${opponentClause}), ` +
-		`picked AS (SELECT id, uuid, outcome FROM ranked WHERE rn <= ${n}) `;
+/** The opponents listed with a view: the most-fought first. */
+function listOpponents(seen: Map<string, { name: string; fights: number }>): { key: string; name: string; fights: number }[] {
+	return [...seen.entries()]
+		.map(([key, v]) => ({ key, name: v.name, fights: v.fights }))
+		.sort((a, b) => b.fights - a.fights || (a.key < b.key ? -1 : a.key > b.key ? 1 : 0))
+		.slice(0, MAX_OPPONENTS_LISTED);
+}
 
-	// Each query is labelled so its rows can be found again below.
-	const labels = ["people", "guns", "opponents"];
-	const statements = [
-		env.DB.prepare(
-			`${picked} SELECT p.uuid, pl.name, pl.first_seen, pl.last_seen, COUNT(*) AS fights,
-			        COALESCE(SUM(p.outcome = 'KILL'), 0) AS kills, COALESCE(SUM(p.outcome = 'DEATH'), 0) AS deaths
-			   FROM picked p JOIN players pl ON pl.uuid = p.uuid GROUP BY p.uuid`,
-		),
-		env.DB.prepare(
-			`${picked} SELECT g.uuid, g.category, g.gun, SUM(g.shots) AS shots, SUM(g.hits) AS hits,
-			        SUM(g.headshots) AS headshots, SUM(g.kills) AS kills
-			   FROM fight_guns g JOIN picked p ON p.id = g.fight_id WHERE g.category = '${category}'
-			  GROUP BY g.uuid, g.category, g.gun`,
-		),
-		env.DB.prepare(
-			`WITH ranked AS (SELECT opponent, ROW_NUMBER() OVER (PARTITION BY uuid ORDER BY ended_at DESC, id DESC) AS rn
-			                   FROM fights WHERE category = '${category}')
-			 SELECT lower(opponent) AS key, MAX(opponent) AS name, COUNT(*) AS fights
-			   FROM ranked WHERE rn <= ${n} AND opponent IS NOT NULL
-			  GROUP BY lower(opponent) ORDER BY fights DESC, key LIMIT ${MAX_OPPONENTS_LISTED}`,
-		),
-	];
-	// Only what this category's ratings read.
-	if (category === "WING") {
-		labels.push("wing_swaps");
-		statements.push(env.DB.prepare(
-			`${picked} SELECT s.uuid, COUNT(*) AS total,
-			        COALESCE(SUM(s.result = 'SUCCESS'), 0) AS successes, COALESCE(SUM(s.result = 'FAILED'), 0) AS failures,
-			        COALESCE(SUM(s.result = 'CANCELED'), 0) AS cancels,
-			        MIN(CASE WHEN s.result = 'SUCCESS' THEN s.total_ms END) AS best_ms,
-			        AVG(CASE WHEN s.result = 'SUCCESS' THEN s.total_ms END) AS total_ms,
-			        AVG(CASE WHEN s.result = 'SUCCESS' THEN s.speed_before_bps END) AS speed_before_bps,
-			        AVG(CASE WHEN s.result = 'SUCCESS' THEN s.speed_after_bps END) AS speed_after_bps
-			   FROM swaps s JOIN picked p ON p.id = s.fight_id WHERE s.category = 'WING' GROUP BY s.uuid`,
-		));
-	} else if (category === "AIR") {
-		labels.push("air_swaps");
-		statements.push(env.DB.prepare(
-			`${picked} SELECT s.uuid, s.swap_type, COUNT(*) AS total,
-			        COALESCE(SUM(s.result = 'SUCCESS'), 0) AS successes, COALESCE(SUM(s.result = 'CANCELED'), 0) AS cancels,
-			        AVG(CASE WHEN s.result = 'SUCCESS' THEN s.total_ms END) AS avg_ms,
-			        MIN(CASE WHEN s.result = 'SUCCESS' THEN s.total_ms END) AS best_ms,
-			        AVG(CASE WHEN s.result = 'SUCCESS' AND s.speed_after_bps IS NOT NULL THEN s.speed_before_bps END) AS speed_before_bps,
-			        AVG(CASE WHEN s.result = 'SUCCESS' AND s.speed_before_bps IS NOT NULL THEN s.speed_after_bps END) AS speed_after_bps,
-			        COALESCE(SUM(s.result = 'SUCCESS' AND s.speed_before_bps IS NOT NULL AND s.speed_after_bps IS NOT NULL), 0) AS momentum_swaps
-			   FROM swaps s JOIN picked p ON p.id = s.fight_id WHERE s.category = 'AIR' GROUP BY s.uuid, s.swap_type`,
-		));
-	} else if (category === "GROUND") {
-		labels.push("movement_guns");
-		statements.push(env.DB.prepare(
-			`${picked} SELECT g.uuid, g.gun, SUM(g.speed_shots) AS shots, SUM(g.speed_total_bps) / SUM(g.speed_shots) AS avg_bps,
-			        MAX(g.speed_best_bps) AS best_bps
-			   FROM fight_guns g JOIN picked p ON p.id = g.fight_id
-			  WHERE g.category = 'GROUND' AND g.speed_shots > 0 GROUP BY g.uuid, g.gun`,
-		));
-	}
-	if (category === "JP" || category === "AIR") {
-		labels.push("combos");
-		statements.push(env.DB.prepare(
-			`${picked} SELECT c.uuid, c.category, SUM(c.enemy_combos) AS enemy_combos, SUM(c.enemy_broken) AS enemy_broken,
-			        SUM(c.own_combos) AS own_combos, SUM(c.own_broken) AS own_broken,
-			        COALESCE(SUM(c.enemy_first_hits), 0) AS enemy_first_hits,
-			        COALESCE(SUM(c.own_first_hits), 0) AS own_first_hits
-			   FROM fight_combos c JOIN picked p ON p.id = c.fight_id WHERE c.category = '${category}' GROUP BY c.uuid, c.category`,
-		));
-	}
-	const results = await env.DB.batch(statements);
-	const rowsOf = (label: string) => (results[labels.indexOf(label)]?.results ?? []) as Record<string, unknown>[];
-
-	const byPlayer = new Map<string, Record<string, unknown>>();
-	for (const row of rowsOf("people")) {
-		byPlayer.set(row.uuid as string, {
-			...row, total: 0, successes: 0, failures: 0, cancels: 0, guns: [], air_swaps: [], combos: [], movement_guns: [],
-		});
-	}
-	/** Adds each row (minus its uuid) to a list on its player. */
-	const addTo = (label: string, list: "guns" | "air_swaps" | "combos" | "movement_guns") => {
-		for (const row of rowsOf(label)) {
-			const { uuid, ...rest } = row;
-			(byPlayer.get(uuid as string)?.[list] as unknown[] | undefined)?.push(roundNumbers(rest));
+/** Adds a stored row's _opp list ([key, name, fights]) to the opponents seen. */
+function countOpponents(seen: Map<string, { name: string; fights: number }>, row: Row): void {
+	for (const [key, name, count] of (row._opp ?? []) as [string, string, number][]) {
+		const known = seen.get(key);
+		if (!known) seen.set(key, { name, fights: count });
+		else {
+			known.fights += count;
+			if (name > known.name) known.name = name;
 		}
-	};
-	addTo("guns", "guns");
-	addTo("air_swaps", "air_swaps");
-	addTo("movement_guns", "movement_guns");
-	addTo("combos", "combos");
-	for (const row of rowsOf("wing_swaps")) {
-		const { uuid, total_ms, speed_before_bps, speed_after_bps, ...counts } = row;
-		const p = byPlayer.get(uuid as string);
-		if (p) Object.assign(p, roundNumbers(counts), { avg: roundNumbers({ total_ms, speed_before_bps, speed_after_bps }) });
+	}
+}
+
+/**
+ * One leaderboard view worked out in full: each player's newest n fights of the category (against the given opponents, if any),
+ * one row read per fight looked at. With an opponent filter only the fights against those names are read (index
+ * fights_category_opponent); without one it is every fight of the category, which is why plain views use the stored rows instead.
+ */
+export async function computeLeaderboard(env: Env, category: string, n: number, opponents: string[]): Promise<string> {
+	// category, n and the names are validated by the caller, so they're safe to write into the SQL.
+	const opponentClause = opponents.length ? ` AND lower(opponent) IN (${opponents.map((o) => `'${o}'`).join(", ")})` : "";
+	// Left to itself SQLite walks the whole category in player order (it suits the ranking); told to, it reads only the fights against those names.
+	const byOpponent = opponents.length ? " INDEXED BY fights_category_opponent" : "";
+	const [picked, people] = await env.DB.batch<Row>([
+		env.DB.prepare(
+			`SELECT ${FIGHT_COLUMNS} FROM (
+			   SELECT ${FIGHT_COLUMNS}, ROW_NUMBER() OVER (PARTITION BY uuid ORDER BY ended_at DESC, id DESC) AS rn
+			     FROM fights${byOpponent} WHERE category = '${category}'${opponentClause})
+			  WHERE rn <= ${n} ORDER BY uuid, ended_at DESC, id DESC`,
+		),
+		env.DB.prepare("SELECT uuid, name, first_seen, last_seen FROM players"),
+	]);
+	const fights = picked.results as unknown as StoredFight[];
+	await healSummaries(env, fights);
+	const byPlayer = new Map<string, Totals>();
+	for (const f of fights) {
+		let totals = byPlayer.get(f.uuid as string);
+		if (!totals) byPlayer.set(f.uuid as string, (totals = new Totals()));
+		totals.add(f);
 	}
 
-	const body = JSON.stringify({
-		category,
-		fights: n,
-		players: [...byPlayer.values()].map(roundNumbers),
-		opponents: rowsOf("opponents").map((r) => ({ key: r.key, name: r.name, fights: r.fights })),
-	});
-	return body;
+	const seen = new Map<string, { name: string; fights: number }>();
+	const players: Row[] = [];
+	for (const p of (people.results as { uuid: string; name: string; first_seen: number; last_seen: number }[]).sort((a, b) => (a.uuid < b.uuid ? -1 : 1))) {
+		const row = byPlayer.get(p.uuid)?.leaderboardRow(category);
+		if (!row) continue;
+		countOpponents(seen, row);
+		delete row._opp;
+		players.push(round2({ uuid: p.uuid, name: p.name, first_seen: p.first_seen, last_seen: p.last_seen, ...row }));
+	}
+	// The opponent chooser lists who was fought in the plain view, whatever the filter is.
+	const listed = opponents.length === 0
+		? listOpponents(seen)
+		: (JSON.parse(await leaderboardBody(env, category, n, [])) as { opponents: unknown[] }).opponents;
+	return JSON.stringify({ category, fights: n, players, opponents: listed });
 }
 
 // ---- Leaderboard rows per player ----
 
 /** The view sizes whose per-player rows are kept (leaderboard_rows, migration 0015). */
-const ROW_WINDOWS = [25, 50, 100];
-/** Most players rebuilt in one request: each costs two database calls, and one request may make only a few dozen. */
-const MAX_REBUILDS_PER_REQUEST = 10;
+const ROW_WINDOWS = [25, 50, 100, 250, 500];
+/** Most players rebuilt in one request: each costs two database calls and adds up to MAX_FIGHTS summaries. */
+const MAX_REBUILDS_PER_REQUEST = 6;
+/**
+ * A player whose fights changed keeps their stored rows for this long before they are rebuilt (a rebuild reads up to 500 fights), so a
+ * player uploading every few minutes costs one rebuild per period, not one per leaderboard view. A player with no rows is built at once.
+ */
+const REBUILD_MIN_AGE_S = 300;
 
 /** Marks a player's rows for one category as out of date (their fights there changed). */
 function dirtyStatement(env: Env, uuid: string, category: string): D1PreparedStatement {
 	return env.DB.prepare("INSERT OR REPLACE INTO leaderboard_dirty (uuid, category, marked_at) VALUES (?, ?, ?)").bind(uuid, category, Date.now());
 }
 
-/** One player's newest n fights of a category. category is already checked against CATEGORIES; binds the uuid. */
-function pickedForPlayer(category: string, n: number): string {
-	return `WITH ranked AS (SELECT id, uuid, outcome, ROW_NUMBER() OVER (ORDER BY ended_at DESC, id DESC) AS rn ` +
-		`FROM fights WHERE category = '${category}' AND uuid = ?), ` +
-		`picked AS (SELECT id, uuid, outcome FROM ranked WHERE rn <= ${n}) `;
-}
-
-/** The same numbers computeLeaderboard works out for everyone, for one player and one view size. */
-function playerWindowStatements(env: Env, uuid: string, category: string, n: number): { labels: string[]; statements: D1PreparedStatement[] } {
-	const picked = pickedForPlayer(category, n);
-	const labels = ["people", "guns", "opponents"];
-	const statements = [
-		env.DB.prepare(
-			`${picked} SELECT COUNT(*) AS fights, COALESCE(SUM(outcome = 'KILL'), 0) AS kills, COALESCE(SUM(outcome = 'DEATH'), 0) AS deaths FROM picked`,
-		).bind(uuid),
-		env.DB.prepare(
-			`${picked} SELECT g.uuid, g.category, g.gun, SUM(g.shots) AS shots, SUM(g.hits) AS hits,
-			        SUM(g.headshots) AS headshots, SUM(g.kills) AS kills
-			   FROM fight_guns g JOIN picked p ON p.id = g.fight_id WHERE g.category = '${category}'
-			  GROUP BY g.uuid, g.category, g.gun`,
-		).bind(uuid),
-		env.DB.prepare(
-			`WITH ranked AS (SELECT opponent, ROW_NUMBER() OVER (ORDER BY ended_at DESC, id DESC) AS rn
-			                   FROM fights WHERE category = '${category}' AND uuid = ?)
-			 SELECT lower(opponent) AS key, MAX(opponent) AS name, COUNT(*) AS fights
-			   FROM ranked WHERE rn <= ${n} AND opponent IS NOT NULL GROUP BY lower(opponent)`,
-		).bind(uuid),
-	];
-	if (category === "WING") {
-		labels.push("wing_swaps");
-		statements.push(env.DB.prepare(
-			`${picked} SELECT s.uuid, COUNT(*) AS total,
-			        COALESCE(SUM(s.result = 'SUCCESS'), 0) AS successes, COALESCE(SUM(s.result = 'FAILED'), 0) AS failures,
-			        COALESCE(SUM(s.result = 'CANCELED'), 0) AS cancels,
-			        MIN(CASE WHEN s.result = 'SUCCESS' THEN s.total_ms END) AS best_ms,
-			        AVG(CASE WHEN s.result = 'SUCCESS' THEN s.total_ms END) AS total_ms,
-			        AVG(CASE WHEN s.result = 'SUCCESS' THEN s.speed_before_bps END) AS speed_before_bps,
-			        AVG(CASE WHEN s.result = 'SUCCESS' THEN s.speed_after_bps END) AS speed_after_bps
-			   FROM swaps s JOIN picked p ON p.id = s.fight_id WHERE s.category = 'WING' GROUP BY s.uuid`,
-		).bind(uuid));
-	} else if (category === "AIR") {
-		labels.push("air_swaps");
-		statements.push(env.DB.prepare(
-			`${picked} SELECT s.uuid, s.swap_type, COUNT(*) AS total,
-			        COALESCE(SUM(s.result = 'SUCCESS'), 0) AS successes, COALESCE(SUM(s.result = 'CANCELED'), 0) AS cancels,
-			        AVG(CASE WHEN s.result = 'SUCCESS' THEN s.total_ms END) AS avg_ms,
-			        MIN(CASE WHEN s.result = 'SUCCESS' THEN s.total_ms END) AS best_ms,
-			        AVG(CASE WHEN s.result = 'SUCCESS' AND s.speed_after_bps IS NOT NULL THEN s.speed_before_bps END) AS speed_before_bps,
-			        AVG(CASE WHEN s.result = 'SUCCESS' AND s.speed_before_bps IS NOT NULL THEN s.speed_after_bps END) AS speed_after_bps,
-			        COALESCE(SUM(s.result = 'SUCCESS' AND s.speed_before_bps IS NOT NULL AND s.speed_after_bps IS NOT NULL), 0) AS momentum_swaps
-			   FROM swaps s JOIN picked p ON p.id = s.fight_id WHERE s.category = 'AIR' GROUP BY s.uuid, s.swap_type`,
-		).bind(uuid));
-	} else if (category === "GROUND") {
-		labels.push("movement_guns");
-		statements.push(env.DB.prepare(
-			`${picked} SELECT g.uuid, g.gun, SUM(g.speed_shots) AS shots, SUM(g.speed_total_bps) / SUM(g.speed_shots) AS avg_bps,
-			        MAX(g.speed_best_bps) AS best_bps
-			   FROM fight_guns g JOIN picked p ON p.id = g.fight_id
-			  WHERE g.category = 'GROUND' AND g.speed_shots > 0 GROUP BY g.uuid, g.gun`,
-		).bind(uuid));
-	}
-	if (category === "JP" || category === "AIR") {
-		labels.push("combos");
-		statements.push(env.DB.prepare(
-			`${picked} SELECT c.uuid, c.category, SUM(c.enemy_combos) AS enemy_combos, SUM(c.enemy_broken) AS enemy_broken,
-			        SUM(c.own_combos) AS own_combos, SUM(c.own_broken) AS own_broken,
-			        COALESCE(SUM(c.enemy_first_hits), 0) AS enemy_first_hits,
-			        COALESCE(SUM(c.own_first_hits), 0) AS own_first_hits
-			   FROM fight_combos c JOIN picked p ON p.id = c.fight_id WHERE c.category = '${category}' GROUP BY c.uuid, c.category`,
-		).bind(uuid));
-	}
-	return { labels, statements };
-}
-
 /**
- * The player's entry as computeLeaderboard builds it, without what changes on its own (name, first and last seen: those
- * are read fresh when a view is put together), plus _opp, the opponents counted in the window. Null with no fights.
+ * Works out one player's rows (every view size, from one read of their newest MAX_FIGHTS fights) for a category and stores
+ * them; clears their dirty mark (if one is given) unless it has been re-marked since.
  */
-function assemblePlayerRow(rowsOf: (label: string) => Record<string, unknown>[]): Record<string, unknown> | null {
-	const people = rowsOf("people")[0];
-	if (!people || !(people.fights as number)) return null;
-	const row: Record<string, unknown> = {
-		fights: people.fights, kills: people.kills, deaths: people.deaths,
-		total: 0, successes: 0, failures: 0, cancels: 0, guns: [], air_swaps: [], combos: [], movement_guns: [],
-	};
-	const addTo = (label: string, list: "guns" | "air_swaps" | "combos" | "movement_guns") => {
-		for (const r of rowsOf(label)) {
-			const { uuid, ...rest } = r;
-			(row[list] as unknown[]).push(roundNumbers(rest));
-		}
-	};
-	addTo("guns", "guns");
-	addTo("air_swaps", "air_swaps");
-	addTo("movement_guns", "movement_guns");
-	addTo("combos", "combos");
-	for (const r of rowsOf("wing_swaps")) {
-		const { uuid, total_ms, speed_before_bps, speed_after_bps, ...counts } = r;
-		Object.assign(row, roundNumbers(counts), { avg: roundNumbers({ total_ms, speed_before_bps, speed_after_bps }) });
-	}
-	row._opp = rowsOf("opponents").map((r) => [r.key, r.name, r.fights]);
-	return row;
-}
-
-/** Works out one player's rows (all view sizes) for a category and stores them; clears their dirty mark if it has not been re-marked since. */
-async function rebuildPlayerRows(env: Env, uuid: string, category: string, markedAt: number): Promise<void> {
-	const plan: { n: number; labels: string[]; from: number }[] = [];
-	const statements: D1PreparedStatement[] = [];
-	for (const n of ROW_WINDOWS) {
-		const window = playerWindowStatements(env, uuid, category, n);
-		plan.push({ n, labels: window.labels, from: statements.length });
-		statements.push(...window.statements);
-	}
-	const results = await env.DB.batch(statements);
+async function rebuildPlayerRows(env: Env, uuid: string, category: string, markedAt: number | null): Promise<void> {
+	const fights = (await newestFights(env, uuid, MAX_FIGHTS, category).all<StoredFight>()).results;
+	await healSummaries(env, fights);
 	const now = Date.now();
 	const writes: D1PreparedStatement[] = [env.DB.prepare("DELETE FROM leaderboard_rows WHERE uuid = ? AND category = ?").bind(uuid, category)];
-	for (const { n, labels, from } of plan) {
-		const row = assemblePlayerRow((label) => {
-			const at = labels.indexOf(label);
-			return at < 0 ? [] : ((results[from + at]?.results ?? []) as Record<string, unknown>[]);
-		});
+	for (const n of ROW_WINDOWS) {
+		const row = totalsOf(fights, n).leaderboardRow(category);
 		if (row) {
 			writes.push(env.DB.prepare("INSERT INTO leaderboard_rows (uuid, category, n, row, built_at) VALUES (?, ?, ?, ?, ?)")
 				.bind(uuid, category, n, JSON.stringify(row), now));
 		}
 	}
+	// Under the limit the read above saw every fight, so the kept count can be put right for free.
+	if (fights.length < MAX_FIGHTS) {
+		writes.push(env.DB.prepare("INSERT OR REPLACE INTO fight_counts (uuid, category, fights) VALUES (?, ?, ?)").bind(uuid, category, fights.length));
+	}
 	// Only if no fight was uploaded meanwhile (it would have set a newer mark).
-	writes.push(env.DB.prepare("DELETE FROM leaderboard_dirty WHERE uuid = ? AND category = ? AND marked_at <= ?").bind(uuid, category, markedAt));
+	if (markedAt !== null) {
+		writes.push(env.DB.prepare("DELETE FROM leaderboard_dirty WHERE uuid = ? AND category = ? AND marked_at <= ?").bind(uuid, category, markedAt));
+	}
 	await env.DB.batch(writes);
 }
 
 /**
- * A plain leaderboard view from the stored per-player rows: first rebuilds the (few) players whose fights changed, then
- * reads one row each. Returns null when the rows cannot be complete yet (players still waiting for their first build),
- * so the caller computes the view in full.
+ * A plain leaderboard view from the stored per-player rows: first rebuilds the (few) players whose fights changed, and any
+ * who have fights but no row of this size (a size added later), then reads one row each. Returns null when the rows cannot
+ * be complete yet (more players waiting than one request may rebuild), so the caller computes the view in full; the players
+ * rebuilt here stay rebuilt, so a few requests later the rows are complete.
  */
 export async function computeLeaderboardFromRows(env: Env, category: string, n: number): Promise<string | null> {
-	const dirty = await env.DB.prepare("SELECT uuid, marked_at FROM leaderboard_dirty WHERE category = ? ORDER BY marked_at LIMIT ?")
-		.bind(category, MAX_REBUILDS_PER_REQUEST)
+	const dirty = await env.DB.prepare(
+		`SELECT d.uuid, d.marked_at FROM leaderboard_dirty d WHERE d.category = ?
+		   AND NOT EXISTS (SELECT 1 FROM leaderboard_rows r WHERE r.uuid = d.uuid AND r.category = d.category AND r.built_at > ?)
+		  ORDER BY d.marked_at LIMIT ?`,
+	)
+		.bind(category, Date.now() - REBUILD_MIN_AGE_S * 1000, MAX_REBUILDS_PER_REQUEST)
 		.all<{ uuid: string; marked_at: number }>();
 	for (const d of dirty.results) await rebuildPlayerRows(env, d.uuid, category, d.marked_at);
 
-	const unbuilt = await env.DB.prepare(
-		`SELECT 1 AS x FROM leaderboard_dirty d WHERE d.category = ?
-		   AND NOT EXISTS (SELECT 1 FROM leaderboard_rows r WHERE r.uuid = d.uuid AND r.category = d.category AND r.n = ?) LIMIT 1`,
-	).bind(category, n).first();
-	if (unbuilt) return null;
+	const rowless = `FROM fight_counts c WHERE c.category = ? AND c.fights > 0
+		AND NOT EXISTS (SELECT 1 FROM leaderboard_rows r WHERE r.uuid = c.uuid AND r.category = c.category AND r.n = ?)`;
+	const room = MAX_REBUILDS_PER_REQUEST - dirty.results.length;
+	if (room > 0) {
+		const waiting = await env.DB.prepare(`SELECT c.uuid ${rowless} LIMIT ?`).bind(category, n, room).all<{ uuid: string }>();
+		const done = new Set(dirty.results.map((d) => d.uuid));
+		for (const w of waiting.results) if (!done.has(w.uuid)) await rebuildPlayerRows(env, w.uuid, category, null);
+	}
+	if (await env.DB.prepare(`SELECT 1 AS x ${rowless} LIMIT 1`).bind(category, n).first()) return null;
 
 	const { results } = await env.DB.prepare(
 		`SELECT r.uuid, r.row, p.name, p.first_seen, p.last_seen
@@ -1192,29 +1204,14 @@ export async function computeLeaderboardFromRows(env: Env, category: string, n: 
 		  WHERE r.category = ? AND r.n = ? ORDER BY r.uuid`,
 	).bind(category, n).all<{ uuid: string; row: string; name: string; first_seen: number; last_seen: number }>();
 
-	const opponents = new Map<string, { name: string; fights: number }>();
+	const seen = new Map<string, { name: string; fights: number }>();
 	const players = results.map((r) => {
-		const row = JSON.parse(r.row) as Record<string, unknown>;
-		for (const [key, name, count] of (row._opp ?? []) as [string, string, number][]) {
-			const seen = opponents.get(key);
-			if (!seen) opponents.set(key, { name, fights: count });
-			else {
-				seen.fights += count;
-				if (name > seen.name) seen.name = name;
-			}
-		}
+		const row = JSON.parse(r.row) as Row;
+		countOpponents(seen, row);
 		delete row._opp;
-		return roundNumbers({ uuid: r.uuid, name: r.name, first_seen: r.first_seen, last_seen: r.last_seen, ...row });
+		return round2({ uuid: r.uuid, name: r.name, first_seen: r.first_seen, last_seen: r.last_seen, ...row });
 	});
-	return JSON.stringify({
-		category,
-		fights: n,
-		players,
-		opponents: [...opponents.entries()]
-			.map(([key, v]) => ({ key, name: v.name, fights: v.fights }))
-			.sort((a, b) => b.fights - a.fights || (a.key < b.key ? -1 : a.key > b.key ? 1 : 0))
-			.slice(0, MAX_OPPONENTS_LISTED),
-	});
+	return JSON.stringify({ category, fights: n, players, opponents: listOpponents(seen) });
 }
 
 export async function readStoredView(env: Env, key: string, ttlSeconds = LEADERBOARD_TTL_S): Promise<string | null> {
@@ -1242,6 +1239,11 @@ export async function storeView(env: Env, key: string, body: string): Promise<vo
 }
 
 // ---- Admin: deleting stats data ----
+
+/** A player's stored fights changed other than by a new one arriving: mods holding a copy of them (FightCache) must start again. */
+function epochStatement(env: Env, uuid: string): D1PreparedStatement {
+	return env.DB.prepare("UPDATE players SET data_epoch = COALESCE(data_epoch, 0) + 1 WHERE uuid = ?").bind(uuid);
+}
 
 /** The logged-in admin's UUID, or a ready 401 / 403 response. */
 async function requireAdmin(request: Request, env: Env): Promise<{ admin: string } | { denied: Response }> {
@@ -1286,8 +1288,8 @@ export function flagRules(): { title: string; requirement: string }[] {
 	];
 }
 
-/** How long the list of flagged players is kept before it is worked out again (it reads about 30 000 rows). */
-const FLAGGED_TTL_S = 900;
+/** How long the list of flagged players is kept before it is worked out again (it reads about 50 000 rows). */
+const FLAGGED_TTL_S = 3600;
 
 /**
  * Admin mode: every player who has at least one warning flag, with all of their flags (the same rules as Player info), the most
@@ -1298,7 +1300,7 @@ async function adminFlagged(request: Request, env: Env): Promise<Response> {
 	const auth = await requireAdmin(request, env);
 	if ("denied" in auth) return auth.denied;
 	const headers = { "Content-Type": "application/json" };
-	const stored = await readStoredView(env, "flagged-players", FLAGGED_TTL_S);
+	const stored = await readStoredView(env, "flagged-players", tightBudget() ? TIGHT_TTL_S : FLAGGED_TTL_S);
 	if (stored) return new Response(stored, { headers });
 
 	const [players, swapStats, gunStats, fightStats, cursorRows, inputRows] = await env.DB.batch([
@@ -1490,6 +1492,9 @@ export function playerFlags(swaps: SwapFlagRow[], guns: GunFlagRow[], fights: nu
  *   GET /admin/player-info?name=Steve     GET /admin/player-info?uuid=<32 hex>
  * Several players with the same name (a changed name): the one seen most recently.
  */
+/** How long one player's admin info is kept before it is worked out again. */
+const PLAYER_INFO_TTL_S = 900;
+
 async function adminPlayerInfo(request: Request, env: Env): Promise<Response> {
 	const auth = await requireAdmin(request, env);
 	if ("denied" in auth) return auth.denied;
@@ -1508,6 +1513,17 @@ async function adminPlayerInfo(request: Request, env: Env): Promise<Response> {
 		return json({ error: "give a player name (1-16 letters, digits, _) or a uuid" }, 400);
 	}
 	if (!player) return json({ error: "no such player" }, 404);
+
+	// The same player's info asked again within PLAYER_INFO_TTL_S is the stored answer (the queries below read about 5 000 rows).
+	// Only 'online' is worked out again. An admin delete empties the stored views (clearLeaderboards), so removed data shows at once.
+	const infoKey = `player-info-${player.uuid}`;
+	const storedInfo = await readStoredView(env, infoKey, tightBudget() ? TIGHT_TTL_S : PLAYER_INFO_TTL_S);
+	if (storedInfo) {
+		const info = JSON.parse(storedInfo) as Record<string, unknown>;
+		info.online = player.last_seen >= Date.now() - PRESENCE_WINDOW_MS;
+		info.last_seen = player.last_seen;
+		return json(info);
+	}
 
 	const [byCategory, last, swaps, swapStats, gunStats, cursorRows, inputRows] = await env.DB.batch([
 		env.DB.prepare(
@@ -1548,7 +1564,7 @@ async function adminPlayerInfo(request: Request, env: Env): Promise<Response> {
 		deaths += c.deaths;
 	}
 	console.log(JSON.stringify({ event: "admin_player_info", admin: auth.admin, target: player.uuid, name: player.name }));
-	return json({
+	const info = {
 		uuid: player.uuid,
 		name: player.name,
 		first_seen: player.first_seen,
@@ -1564,7 +1580,9 @@ async function adminPlayerInfo(request: Request, env: Env): Promise<Response> {
 		last_fight_at: ((last.results?.[0] as { last_fight_at: number | null } | undefined)?.last_fight_at) ?? null,
 		swaps: ((swaps.results?.[0] as { swaps: number } | undefined)?.swaps) ?? 0,
 		flags: [...playerFlags(swapStats.results as SwapFlagRow[], gunStats.results as GunFlagRow[], fights, kills, deaths), ...cursorFlags(cursorRows.results as CursorRow[]), ...inputFlags(inputRows.results as InputRow[])],
-	});
+	};
+	await storeView(env, infoKey, JSON.stringify(info));
+	return json(info);
 }
 
 /**
@@ -1585,6 +1603,8 @@ async function adminDeletePlayerData(request: Request, env: Env, target: string)
 		env.DB.prepare("DELETE FROM fight_guns WHERE uuid = ?").bind(target),
 		env.DB.prepare("DELETE FROM fight_combos WHERE uuid = ?").bind(target),
 		env.DB.prepare("DELETE FROM fights WHERE uuid = ?").bind(target),
+		env.DB.prepare("DELETE FROM fight_counts WHERE uuid = ?").bind(target),
+		epochStatement(env, target),
 	]);
 	await clearLeaderboardRows(env, target);
 	await clearLeaderboards(env);
@@ -1608,9 +1628,12 @@ async function adminDeleteFight(request: Request, env: Env, target: string, figh
 		env.DB.prepare("DELETE FROM fight_guns WHERE fight_id = ?").bind(fight.id),
 		env.DB.prepare("DELETE FROM fight_combos WHERE fight_id = ?").bind(fight.id),
 		env.DB.prepare("DELETE FROM fights WHERE id = ?").bind(fight.id),
+		env.DB.prepare("UPDATE fight_counts SET fights = MAX(0, fights - 1) WHERE uuid = ? AND category = ?").bind(target, fight.category ?? ""),
+		epochStatement(env, target),
 	]);
 	if (fight.category) {
 		try {
+			await env.DB.prepare("DELETE FROM leaderboard_rows WHERE uuid = ? AND category = ?").bind(target, fight.category).run();
 			await dirtyStatement(env, target, fight.category).run();
 		} catch {
 			// no table yet
