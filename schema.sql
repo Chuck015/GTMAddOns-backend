@@ -40,16 +40,18 @@ CREATE TABLE IF NOT EXISTS fights (
 	opponent_track    TEXT,       -- JSON text: the opponent's PvP type changes and swaps during the fight (migration 0020)
 	net_ended         INTEGER,    -- 1 when the mod cut the fight at a conceded Net Launcher net (migration 0022)
 	summary           TEXT,       -- JSON text: the fight's totals, read by every stats view (src/summary.ts, migration 0023)
+	detail            TEXT,       -- JSON text: the fight's swaps, gun totals and combo totals (src/detail.ts, migration 0025)
+	mouse_input       TEXT,       -- JSON text: how the mouse moved during the fight (the mod's MouseTracker, migration 0026; information only)
 	UNIQUE (uuid, fight_key)
 );
 
-CREATE INDEX IF NOT EXISTS fights_uuid_ended ON fights (uuid, ended_at);
 CREATE INDEX IF NOT EXISTS fights_uuid_category_ended ON fights (uuid, category, ended_at);
-CREATE INDEX IF NOT EXISTS fights_category_uuid_ended ON fights (category, uuid, ended_at);
 -- Migration 0023: fights stored after a given one (?since=), and opponent-filtered leaderboards.
 CREATE INDEX IF NOT EXISTS fights_uuid_id ON fights (uuid, id);
 CREATE INDEX IF NOT EXISTS fights_category_opponent ON fights (category, lower(opponent));
 
+-- The three tables below are from before migration 0025: a fight's swaps, gun totals and combo totals are now kept in
+-- fights.detail and nothing is written here any more. They are only read to give an old fight its detail.
 CREATE TABLE IF NOT EXISTS swaps (
 	id                 INTEGER PRIMARY KEY AUTOINCREMENT,
 	fight_id           INTEGER NOT NULL,

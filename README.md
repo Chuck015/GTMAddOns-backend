@@ -23,12 +23,14 @@ The mod uploads to it, and the Player Stats / Personal Stats menus read from it.
 - **Dev mode:** only UUIDs in `DEV_UUIDS` in `wrangler.toml` can turn
   on dev mode (Settings in the `/gao` menu). After editing the list, run `npx wrangler deploy`.
 - **Gun stats** are stored as totals per gun per fight
-  (`fight_guns` table), not one row per shot. Automatic guns fire too
+  (inside the fight's `detail`), not one row per shot. Automatic guns fire too
   fast for per-shot rows to fit in D1's free daily write limit.
 - **Row budget:** D1's free plan allows 5 million rows read a day, so no view
   reads a whole history. Each fight stores its own totals (`fights.summary`,
   `src/summary.ts`), leaderboards are built from one stored row per player, the
   mod keeps the fights it has read and asks only for newer ones
   (`/players/:uuid/fights?since=`), and every request's rows are counted per route
-  and day in `usage_daily` (`src/usage.ts`). After adding the `summary` column to
-  an existing database, run `node scripts/backfill-summaries.mjs --remote` once.
+  and day in `usage_daily` (`src/usage.ts`). Rows written are limited too (100,000
+  a day, index entries included), so a fight is a single row: its swaps, gun totals
+  and combo totals are one JSON text on it (`fights.detail`, `src/detail.ts`). A fight
+  whose `summary` is NULL gets it worked out again from its detail when it is next read.

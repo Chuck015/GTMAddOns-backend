@@ -7,8 +7,9 @@
  *
  *   SELECT * FROM usage_daily WHERE day = '2026-10-10' ORDER BY rows_read DESC;   -- route '*' is the day's total
  *
- * Counts are gathered in memory and written in one go every so often (a write per request would itself use the write
- * allowance), so a little is lost when Cloudflare retires a worker instance: the table slightly undercounts.
+ * Counts are gathered in memory and written in one go every ten minutes (or 400 requests, or 50 000 rows): writing them more
+ * often used a tenth of the day's write allowance by itself. What an instance has gathered is lost when Cloudflare retires
+ * it, so the table undercounts; `wrangler d1 insights swapinfo` gives the exact numbers when they matter.
  *
  * Past TIGHT_ROWS_READ in a day, tightBudget() turns true and the stored views (leaderboards, raw info, flagged players)
  * are served however old they are instead of being worked out again, so uploads keep working to the end of the day.
@@ -19,9 +20,9 @@ export interface Used { read: number; written: number }
 /** 80% of the free plan's 5 million rows read per day. */
 const TIGHT_ROWS_READ = 4_000_000;
 /** Write the gathered counts once this much has built up, or this long has passed. */
-const FLUSH_ROWS = 2000;
-const FLUSH_REQUESTS = 40;
-const FLUSH_MS = 60_000;
+const FLUSH_ROWS = 50_000;
+const FLUSH_REQUESTS = 400;
+const FLUSH_MS = 600_000;
 
 class CountedStatement {
 	constructor(readonly inner: D1PreparedStatement, private readonly used: Used) {}
