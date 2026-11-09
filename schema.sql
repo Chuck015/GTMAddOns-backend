@@ -42,6 +42,7 @@ CREATE TABLE IF NOT EXISTS fights (
 	summary           TEXT,       -- JSON text: the fight's totals, read by every stats view (src/summary.ts, migration 0023)
 	detail            TEXT,       -- JSON text: the fight's swaps, gun totals and combo totals (src/detail.ts, migration 0025)
 	mouse_input       TEXT,       -- JSON text: how the mouse moved during the fight (the mod's MouseTracker, migration 0026; information only)
+	probes            TEXT,       -- JSON text: what the remote config's probe rules measured (the mod's Probes, migration 0027; information only)
 	UNIQUE (uuid, fight_key)
 );
 
@@ -211,4 +212,11 @@ CREATE TABLE IF NOT EXISTS notice_deliveries (
   uuid         TEXT    NOT NULL,
   delivered_at INTEGER NOT NULL,
   PRIMARY KEY (notice_id, uuid)
+);
+
+-- Migration 0027: the config the mod fetches from GET /config (one row; set with scripts/set-config.mjs).
+CREATE TABLE IF NOT EXISTS remote_config (
+  id         INTEGER PRIMARY KEY CHECK (id = 1),
+  body       TEXT    NOT NULL,
+  updated_at INTEGER NOT NULL
 );

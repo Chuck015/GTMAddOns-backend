@@ -92,9 +92,25 @@ const SWAP_TYPES = new Set(["WINGSUIT", "JETPACK", "JP_TO_WING", "WING_TO_JP"]);
 const MOUSE_KEYS = ["ms", "frames", "mouse_deg", "yaw_deg", "pitch_deg", "turn_deg", "other_deg", "other_frames", "moving_ms", "still_ms", "mouse_frames", "peak_dps", "fast_moves",
 	// How the player clicked (the mod's ClickTracker): information only, sent with the mouse numbers.
 	"click_left", "click_right", "click_bursts", "click_cps", "click_peak_cps", "click_interval_ms", "click_sd_ms", "click_cv", "click_min_ms", "click_doubles",
-	"melee_hits", "melee_blanks", "melee_misses", "hit_gap_plain_n", "hit_gap_plain_ms", "hit_gap_blank_n", "hit_gap_blank_ms"] as const;
+	"melee_hits", "melee_blanks", "melee_misses", "hit_gap_plain_n", "hit_gap_plain_ms", "hit_gap_blank_n", "hit_gap_blank_ms",
+	// How well the player kept their crosshair on their melee target (the mod's MeleeAimTracker): information only, for a future aim rating.
+	"aim_range_ms", "aim_on_ms", "aim_on_pct", "aim_err_deg", "aim_err_sd", "aim_yaw_err", "aim_pitch_err", "aim_target_dps", "aim_dist",
+	"aim_reacquires", "aim_reacquire_ms", "aim_clicks_range", "aim_clicks_on", "aim_on_hits", "aim_on_blanks", "aim_on_misses",
+	// Combo timing (the mod's ComboTracker.Stats): to work out GTM's combo rules from everyone's fights.
+	"combo_locks", "combo_hits", "combo_lock_blanks", "combo_recover_blanks", "combo_lock_first_n", "combo_lock_first_sum", "combo_lock_first_min", "combo_lock_first_max", "combo_lock_drop_n", "combo_lock_drop_sum", "combo_lock_drop_min", "combo_lock_drop_max", "combo_recover_first_n", "combo_recover_first_sum", "combo_recover_first_min", "combo_recover_first_max", "combo_recover_drop_n", "combo_recover_drop_sum", "combo_recover_drop_min", "combo_recover_drop_max", "combo_clear_n", "combo_clear_sum", "combo_clear_min", "combo_clear_max"] as const;
 // Keys of the fight's movement_input object that are kept (all numbers); anything else the mod sends is dropped.
-const MOVEMENT_KEYS = ["ms", "w_ms", "a_ms", "s_ms", "d_ms", "still_ms", "ground_ms", "sprint_ms", "sneak_ms", "strafe_switches", "fb_switches", "jumps", "distance", "max_bps"] as const;
+const MOVEMENT_KEYS = ["ms", "w_ms", "a_ms", "s_ms", "d_ms", "still_ms", "ground_ms", "sprint_ms", "sneak_ms", "strafe_switches", "fb_switches", "jumps", "distance", "max_bps",
+	// How the player was moving at each shot and each hit taken (the mod's MoveStates): time, shots, hits, headshots and hits taken per state.
+	"st_air_ms", "st_air_shots", "st_air_hits", "st_air_hs", "st_air_taken", "st_still_ms", "st_still_shots", "st_still_hits", "st_still_hs", "st_still_taken", "st_strafe_ms", "st_strafe_shots", "st_strafe_hits", "st_strafe_hs", "st_strafe_taken", "st_run_ms", "st_run_shots", "st_run_hits", "st_run_hs", "st_run_taken"] as const;
+
+// Probe results (the mod's Probes, rules from remote_config): flat numbers per fight, kept as JSON text in fights.probes. Any rule id the
+// config ever had is accepted, so fights recorded under an older config still keep theirs; the limits stop junk.
+const PROBE_KEY = /^[a-z0-9_]{1,32}(\.[a-z0-9_]{1,24})?$/;
+const MAX_PROBE_KEYS = 200;
+const MAX_PROBES_LENGTH = 6000;
+/** How long one Worker keeps the config it read, and browsers / Cloudflare may cache GET /config. */
+const CONFIG_CACHE_MS = 60_000;
+const CONFIG_MAX_AGE_S = 300;
 
 export default {
 	async fetch(request, env, ctx): Promise<Response> {
@@ -118,6 +134,7 @@ async function route(request: Request, env: Env): Promise<Response> {
 	if (method === "POST" && pathname === "/auth/challenge") return createChallenge(env);
 	if (method === "POST" && pathname === "/auth/login") return login(request, env);
 	if (method === "GET" && pathname === "/me") return me(request, env);
+	if (method === "GET" && pathname === "/config") return remoteConfig(env);
 	if (method === "POST" && pathname === "/presence") return presence(request, env);
 	if (method === "GET" && pathname === "/users") return modUsers(request, env);
 	if (method === "POST" && pathname === "/users/check") return checkModUsers(request, env);
@@ -564,6 +581,19 @@ async function uploadFight(request: Request, env: Env): Promise<Response> {
 		if (Object.keys(kept).length > 0) mouseInput = JSON.stringify(kept);
 	}
 
+	// What the remote config's probe rules measured in the fight (information only, shown in Raw info).
+	let probes: string | null = null;
+	if (body?.probes && typeof body.probes === "object" && !Array.isArray(body.probes)) {
+		const kept: Record<string, number> = {};
+		for (const [key, raw] of Object.entries(body.probes as Record<string, unknown>)) {
+			if (Object.keys(kept).length >= MAX_PROBE_KEYS) break;
+			const v = finiteOrNull(raw);
+			if (v !== null && PROBE_KEY.test(key)) kept[key] = Math.round(v * 100) / 100;
+		}
+		const text = JSON.stringify(kept);
+		if (Object.keys(kept).length > 0 && text.length <= MAX_PROBES_LENGTH) probes = text;
+	}
+
 	const statements: D1PreparedStatement[] = [];
 	const swapRows: Row[] = [], gunRows: Row[] = [], comboRows: Row[] = [];
 
@@ -639,9 +669,9 @@ async function uploadFight(request: Request, env: Env): Promise<Response> {
 	// (detail: the swaps, gun totals and combo totals, see detail.ts). Nothing is written to swaps / fight_guns / fight_combos any more.
 	statements.push(
 		env.DB.prepare(
-			"INSERT INTO fights (uuid, fight_key, started_at, ended_at, outcome, opponent, category, opponent_category, opponent_gear, movement_input, opponent_track, net_ended, summary, detail, mouse_input) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+			"INSERT INTO fights (uuid, fight_key, started_at, ended_at, outcome, opponent, category, opponent_category, opponent_gear, movement_input, opponent_track, net_ended, summary, detail, mouse_input, probes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
 		).bind(uuid, fightKey, startedAt, endedAt, outcome, opponent, category, opponentCategory, opponentGear, movementInput, opponentTrack, netEnded,
-			JSON.stringify(buildSummary(swapRows, gunRows, comboRows)), encodeDetail(swapRows, gunRows, comboRows), mouseInput),
+			JSON.stringify(buildSummary(swapRows, gunRows, comboRows)), encodeDetail(swapRows, gunRows, comboRows), mouseInput, probes),
 	);
 
 	// Keep only the newest MAX_FIGHTS fights of this category. The player's count is kept in fight_counts, so nothing is looked
@@ -1694,6 +1724,24 @@ async function adminDeleteFight(request: Request, env: Env, target: string, figh
 }
 
 // ---- Helpers ----
+
+/** The config this Worker read last, and when. */
+let configCache: { body: string; at: number } | null = null;
+
+/**
+ * GET /config: the remote config the mod fetches (switches for its trackers, numbers, message patterns and probe rules; see the mod's
+ * Remote and Probes). No login: it holds nothing private. One row in remote_config, set with scripts/set-config.mjs; none = defaults.
+ */
+async function remoteConfig(env: Env): Promise<Response> {
+	const now = Date.now();
+	if (!configCache || now - configCache.at > CONFIG_CACHE_MS) {
+		const row = await env.DB.prepare("SELECT body FROM remote_config WHERE id = 1").first<{ body: string }>();
+		configCache = { body: row?.body ?? "{\"version\":0}", at: now };
+	}
+	return new Response(configCache.body, {
+		headers: { "Content-Type": "application/json", "Cache-Control": `public, max-age=${CONFIG_MAX_AGE_S}` },
+	});
+}
 
 function json(data: unknown, status = 200): Response {
 	return new Response(JSON.stringify(data), {
